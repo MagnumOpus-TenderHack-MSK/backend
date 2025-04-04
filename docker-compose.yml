@@ -1,0 +1,77 @@
+version: '3.8'
+
+services:
+  api:
+    build: .
+    container_name: chat-api
+    env_file:
+      - .env
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    volumes:
+      - ./static:/app/static
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - chat-network
+    restart: unless-stopped
+
+  worker:
+    build: .
+    container_name: chat-worker
+    command: worker
+    env_file:
+      - .env
+    volumes:
+      - ./static:/app/static
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - chat-network
+    restart: unless-stopped
+
+  beat:
+    build: .
+    container_name: chat-beat
+    command: beat
+    env_file:
+      - .env
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - chat-network
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: chat-postgres
+    environment:
+      - POSTGRES_USER=${DB_USER:-postgres}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-postgres}
+      - POSTGRES_DB=${DB_NAME:-chat_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    networks:
+      - chat-network
+    restart: unless-stopped
+
+  redis:
+    image: redis:alpine
+    container_name: chat-redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    networks:
+      - chat-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+
+networks:
+  chat-network:
+    driver: bridge

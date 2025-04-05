@@ -1,6 +1,5 @@
 import json
 import logging
-
 from typing import List, Optional, Dict, Any
 from uuid import UUID
 
@@ -21,12 +20,36 @@ from app.schemas.chat import (
     ReactionCreate
 )
 from app.services import chat_service, ai_service
-from app.tasks.message_tasks import update_message_status, save_completed_message, get_message_content_from_redis, \
-    save_message_chunk_to_redis
+from app.tasks.message_tasks import update_message_status, save_completed_message, get_message_content_from_redis, save_message_chunk_to_redis
 from app.core.config import settings
 
 router = APIRouter(prefix="/chats", tags=["Chats"])
 logger = logging.getLogger(__name__)
+
+# Define cluster mappings (same as used in admin)
+general_clusters = [
+    'Общие вопросы о работе с системой', 'Процессы закупок', 'Работа с контрактами',
+    'Оферты и коммерческие предложения', 'Документы', 'Работа с категориями продукции',
+    'Техническая поддержка', 'Чаты и обсуждения', 'Финансовые операции',
+    'Новости и обновления', 'Регуляторные и юридические вопросы', 'Ошибки и предупреждения',
+    'Бессмысленный запрос'
+]
+
+sub_clusters = {
+    'Общие вопросы о работе с системой': ['Регистрация и вход в систему', 'Настройка личного кабинета', 'Поиск информации'],
+    'Процессы закупок': ['Прямые закупки', 'Котировочные сессии', 'Закупки по потребностям'],
+    'Работа с контрактами': ['Формирование и подписание контрактов', 'Исполнение контрактов'],
+    'Оферты и коммерческие предложения': ['Создание и редактирование оферт', 'Запросы на коммерческие предложения'],
+    'Документы': ['Добавление и удаление документов', 'Редактирование и обновление документации'],
+    'Работа с категориями продукции': ['Выбор конечной категории продукции', 'Использование справочников'],
+    'Техническая поддержка': ['Решение проблем с системой', 'Вопросы о доступности функций'],
+    'Чаты и обсуждения': ['Использование чатов', 'Обсуждение конкретных закупок и контрактов'],
+    'Финансовые операции': ['Банковские гарантии и финансовые инструменты', 'Логистика и связанные услуги'],
+    'Новости и обновления': ['Информация о новых возможностях портала', 'Новости о тендерах и закупках'],
+    'Регуляторные и юридические вопросы': ['Вопросы, связанные с нормативными документами', 'Правила участия в закупках'],
+    'Ошибки и предупреждения': ['Вопросы о неправильных действиях', 'Работа с блокировками или жалобами'],
+    'Бессмысленный запрос': []
+}
 
 
 @router.get("", response_model=ChatList)
@@ -48,9 +71,7 @@ def get_chats(
             limit=limit
         )
 
-        # Manually convert items to create the ChatList
         chat_items = [ChatSchema.from_orm(chat) for chat in chats_data["items"]]
-
         logger.info(f"Successfully fetched {len(chat_items)} chats")
         return ChatList(
             items=chat_items,
@@ -114,9 +135,7 @@ def get_messages(
             limit=limit
         )
 
-        # Manually convert items to create the MessageList
         message_items = [MessageSchema.from_orm(msg) for msg in messages_data["items"]]
-
         logger.info(f"Successfully fetched {len(message_items)} messages")
         return MessageList(
             items=message_items,
@@ -139,8 +158,6 @@ async def create_message(
     """
     try:
         logger.info(f"Creating message in chat {chat.id}: {message_data.content[:30]}...")
-
-        # Create user message
         user_message = chat_service.create_user_message(
             db=db,
             chat_id=chat.id,
@@ -148,23 +165,15 @@ async def create_message(
         )
         logger.info(f"Created user message {user_message.id}")
 
-        # Create AI message (pending)
         ai_message = chat_service.create_ai_message(
             db=db,
             chat_id=chat.id
         )
         logger.info(f"Created pending AI message {ai_message.id}")
 
-        # Get conversation history
         messages = chat.messages
-
-        # Prepare conversation history for AI service
         conversation_history = ai_service.prepare_conversation_history(messages)
-
-        # Get host from request or settings
         host = str(request.base_url).rstrip('/')
-
-        # Create callback URL - ai_service will use CALLBACK_HOST if set, otherwise use request host
         callback_url = ai_service.create_callback_url(
             host=host,
             chat_id=chat.id,
@@ -172,29 +181,46 @@ async def create_message(
         )
         logger.info(f"Callback URL created: {callback_url}")
 
-        # Send message to AI service
-        logger.info("Sending message to AI service")
-        success = ai_service.send_to_ai_service(
+        # Send message to AI service and get full response with additional meta data
+        ai_response = ai_service.send_to_ai_service(
             message_content=message_data.content,
             conversation_history=conversation_history,
             callback_url=callback_url
         )
 
-        # Update message status based on AI service response
-        if success:
+        if ai_response.get("success"):
             logger.info(f"Message sent to AI service, updating status to PROCESSING")
             update_message_status.delay(
                 message_id=str(ai_message.id),
                 status=MessageStatus.PROCESSING
             )
+            # Update chat title if current title is default
+            if ai_response.get("name") and (chat.title in ["Новый чат", "", None]):
+                chat.title = ai_response["name"]
+                db.commit()
+            # Update clusters: map returned subclusters to general clusters
+            if ai_response.get("cluster"):
+                new_subcategories = ai_response["cluster"]
+                new_general = []
+                for sub in new_subcategories:
+                    for general, subs in sub_clusters.items():
+                        if sub in subs:
+                            new_general.append(general)
+                new_general = list(set(new_general))
+                chat.subcategories = new_subcategories
+                chat.categories = new_general
+                db.commit()
+            # Store suggestions to be shown in the UI
+            if ai_response.get("suggestions"):
+                chat.suggestions = ai_response["suggestions"]
+                db.commit()
+
         else:
             logger.error("Failed to send message to AI service")
             update_message_status.delay(
                 message_id=str(ai_message.id),
                 status=MessageStatus.FAILED
             )
-
-            # Update AI message with error content
             chat_service.update_ai_message(
                 db=db,
                 message_id=ai_message.id,

@@ -53,3 +53,20 @@ async def get_chat_by_id(
         )
 
     return chat
+
+async def get_current_admin_user(
+    current_user: User = Depends(get_current_active_user),
+) -> User:
+    """
+    Get current user and verify they have admin privileges.
+    For development, we'll allow all users to access admin features.
+    In production, uncomment the check for is_admin.
+    """
+    # DEVELOPMENT MODE: Allow all users to access admin features
+    # PRODUCTION MODE: Uncomment the next lines to enforce admin access
+    # if not current_user.is_admin:
+    #     raise HTTPException(
+    #         status_code=status.HTTP_403_FORBIDDEN,
+    #         detail="Admin privileges required"
+    #     )
+    return current_user

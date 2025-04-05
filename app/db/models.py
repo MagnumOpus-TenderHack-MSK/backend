@@ -5,9 +5,9 @@ from datetime import datetime
 from sqlalchemy import (
     Boolean, Column, ForeignKey, Integer, String,
     Text, DateTime, Enum as SQLEnum, LargeBinary,
-    Float
+    Float, Table
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, ARRAY
 from sqlalchemy.orm import relationship
 
 from app.db.base import Base
@@ -71,6 +71,10 @@ class Chat(Base):
     user_id = Column(UUID(as_uuid=True), ForeignKey("user.id"), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    categories = Column(ARRAY(String), default=[])
+    subcategories = Column(ARRAY(String), default=[])
+    # NEW: suggestions to show quick reply buttons on the frontend
+    suggestions = Column(ARRAY(String), default=[])
 
     # Relationships
     user = relationship("User", back_populates="chats")
@@ -125,7 +129,7 @@ class File(Base):
     size = Column(Integer, nullable=False)
     mime_type = Column(String, nullable=False)
     file_type = Column(SQLEnum(FileType), nullable=False, default=FileType.OTHER)
-    content = Column(Text, nullable=True)  # Extracted text content
+    content = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -161,7 +165,7 @@ class MessageFile(Base):
 
     # Relationships
     message = relationship("Message", back_populates="files")
-    file = relationship("File", back_populates="message_files", lazy="joined")  # Use joined loading
+    file = relationship("File", back_populates="message_files", lazy="joined")
 
     @property
     def name(self):
@@ -179,6 +183,7 @@ class MessageFile(Base):
 
     def __repr__(self):
         return f"<MessageFile {self.message_id} - {self.file_id}>"
+
 
 class Source(Base):
     """Source model for message sources."""

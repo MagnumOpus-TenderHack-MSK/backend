@@ -267,7 +267,7 @@ async def message_callback(
 ):
     """
     Callback endpoint for AI service to send message chunks.
-    This endpoint now accepts JSON responses in the following format only:
+    This endpoint accepts JSON responses in the following format:
     {
         "chunk_id": "<chunk_id>",
         "content": "<content>",
@@ -292,7 +292,7 @@ async def message_callback(
         )
 
     # Validate that data contains the expected keys
-    required_keys = ["chunk_id", "content", "is_final", "context_used"]
+    required_keys = ["chunk_id", "content", "is_final"]
     if not all(key in data for key in required_keys):
         logger.error("Callback data missing required keys")
         raise HTTPException(
@@ -311,25 +311,31 @@ async def message_callback(
     is_final = data.get("is_final", False)
     context_used = data.get("context_used", [])
 
-    # Append this chunk to Redis (or similar) so that chunks accumulate
+    # Append this chunk to Redis
     await save_message_chunk_to_redis(str(message_id), content)
+
+    # Send only the new chunk to the client for smooth typing
     await broadcast_message_chunk(chat_id, user_id, message_id, content)
 
     if is_final:
         # Retrieve the full accumulated message content
         full_content = await get_message_content_from_redis(str(message_id))
-        message = db.query(Message).filter(Message.id == message_id, Message.chat_id == chat_id).first()
-        if not message:
-            raise HTTPException(status_code=404, detail="Message not found")
+
+        # Update the message in the database
         message.content = full_content
         message.status = MessageStatus.COMPLETED
         db.commit()
         db.refresh(message)
+
+        # Use celery task to process sources and finalize message
         save_completed_message.delay(
             message_id=str(message_id),
             content=full_content,
             sources=context_used
         )
+
+        # Send complete notification to client
         await broadcast_message_complete(chat_id, user_id, message_id, context_used)
+
     return {"status": "success"}
 

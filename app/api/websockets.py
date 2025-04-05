@@ -185,7 +185,10 @@ async def websocket_endpoint(
 
             # Close WebSocket if still connected
             if websocket.client_state.CONNECTED:
-                await websocket.close()
+                try:
+                    await websocket.close()
+                except Exception as e:
+                    logger.error(f"Error closing WebSocket: {str(e)}", exc_info=True)
 
     except Exception as e:
         logger.error(f"WebSocket initialization error: {str(e)}", exc_info=True)

@@ -17,8 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 @shared_task
-def save_completed_message(message_id: str, content: str, sources: Optional[List[Dict[str, Any]]] = None) -> Optional[
-    str]:
+def save_completed_message(message_id: str, content: str, sources: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
     """
     Save a completed AI message to the database.
 
@@ -102,6 +101,7 @@ def update_message_status(message_id: str, status: str) -> Optional[str]:
 async def save_message_chunk_to_redis(message_id: str, chunk: str) -> bool:
     """
     Save a message chunk to Redis.
+    This appends the new chunk to any existing content for this message.
     """
     try:
         redis = Redis.from_url(settings.REDIS_URL)

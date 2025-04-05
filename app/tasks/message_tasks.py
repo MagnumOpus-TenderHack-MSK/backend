@@ -17,7 +17,8 @@ logger = logging.getLogger(__name__)
 
 
 @shared_task
-def save_completed_message(message_id: str, content: str, sources: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
+def save_completed_message(message_id: str, content: str, sources: Optional[List[Dict[str, Any]]] = None) -> Optional[
+    str]:
     """
     Save a completed AI message to the database.
 
@@ -115,6 +116,12 @@ async def save_message_chunk_to_redis(message_id: str, chunk: str) -> bool:
         # Set expiration (1 hour)
         await redis.expire(redis_key, 3600)
 
+        # Also store a timestamp of the last update for this message
+        timestamp_key = f"message:{message_id}:last_updated"
+        timestamp = await redis.time()
+        await redis.set(timestamp_key, int(timestamp[0]))
+        await redis.expire(timestamp_key, 3600)
+
         await redis.close()
 
         return True
@@ -148,3 +155,83 @@ async def get_message_content_from_redis(message_id: str) -> str:
     except Exception as e:
         logger.error(f"Error getting message content from Redis: {str(e)}", exc_info=True)
         return ""
+
+
+async def check_in_progress_messages() -> List[Dict[str, Any]]:
+    """
+    Check for all in-progress messages in Redis.
+    Returns a list of message IDs and their content.
+    """
+    try:
+        redis = Redis.from_url(settings.REDIS_URL)
+
+        # Get all message keys
+        keys = await redis.keys("message:*")
+
+        # Filter out timestamp keys
+        message_keys = [key for key in keys if b":last_updated" not in key]
+
+        result = []
+        for key in message_keys:
+            message_id = key.decode('utf-8').replace("message:", "")
+            content = await redis.get(key)
+
+            # Get the last updated timestamp if available
+            timestamp_key = f"message:{message_id}:last_updated"
+            timestamp = await redis.get(timestamp_key)
+            last_updated = int(timestamp.decode('utf-8')) if timestamp else None
+
+            if content:
+                result.append({
+                    "message_id": message_id,
+                    "content": content.decode('utf-8'),
+                    "last_updated": last_updated
+                })
+
+        await redis.close()
+        return result
+
+    except Exception as e:
+        logger.error(f"Error checking in-progress messages: {str(e)}", exc_info=True)
+        return []
+
+
+async def clean_old_messages(older_than_seconds: int = 3600) -> int:
+    """
+    Clean up old message content from Redis.
+    Returns the number of keys removed.
+    """
+    try:
+        redis = Redis.from_url(settings.REDIS_URL)
+
+        # Get current server time
+        current_time = int(redis.time()[0])
+
+        # Get all timestamp keys
+        keys = await redis.keys("message:*:last_updated")
+
+        removed = 0
+        for key in keys:
+            timestamp = await redis.get(key)
+
+            if timestamp:
+                last_updated = int(timestamp.decode('utf-8'))
+
+                # If older than the specified time
+                if current_time - last_updated > older_than_seconds:
+                    # Extract message ID
+                    message_id = key.decode('utf-8').split(':')[1]
+
+                    # Delete message content and timestamp
+                    content_key = f"message:{message_id}"
+                    await redis.delete(content_key)
+                    await redis.delete(key)
+
+                    removed += 1
+
+        await redis.close()
+        return removed
+
+    except Exception as e:
+        logger.error(f"Error cleaning old messages: {str(e)}", exc_info=True)
+        return 0

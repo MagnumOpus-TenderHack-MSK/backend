@@ -2,6 +2,7 @@ from uuid import UUID
 
 from fastapi import Depends, HTTPException, status
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.core.security import get_current_user
 from app.db.models import User, Chat
@@ -37,7 +38,9 @@ async def get_chat_by_id(
     """
     Dependency to get a chat by ID and check if the current user has access.
     """
-    chat = db.query(Chat).filter(Chat.id == chat_id).first()
+    chat = await run_in_threadpool(
+        lambda: db.query(Chat).filter(Chat.id == chat_id).first()
+    )
 
     if not chat:
         raise HTTPException(

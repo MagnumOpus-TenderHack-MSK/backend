@@ -148,6 +148,33 @@ def create_user_message(db: Session, chat_id: UUID, message_data: MessageCreate)
         )
 
 
+def create_system_message(db: Session, chat_id: UUID, content: str) -> Message:
+    """
+    Create a new system message.
+    """
+    try:
+        # Create message
+        message = Message(
+            chat_id=chat_id,
+            content=content,
+            message_type=MessageType.SYSTEM,
+            status=MessageStatus.COMPLETED
+        )
+
+        db.add(message)
+        db.commit()
+        db.refresh(message)
+
+        return message
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error creating system message: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create system message"
+        )
+
+
 def create_ai_message(db: Session, chat_id: UUID, content: str = "") -> Message:
     """
     Create a new AI message with pending status.

@@ -35,7 +35,8 @@ def prepare_conversation_history(messages: List[Message]) -> List[Dict[str, Any]
 def send_to_ai_service(
         message_content: str,
         conversation_history: List[Dict[str, Any]],
-        callback_url: str
+        callback_url: str,
+        file_contents: Optional[List[Dict[str, Any]]] = None
 ) -> Dict[str, Any]:
     """
     Send a message to the AI service for processing.
@@ -46,6 +47,12 @@ def send_to_ai_service(
       - suggestions: list of suggestion strings
       - name: new chat name (if provided)
       - cluster: list of subclusters from the AI response
+
+    Args:
+        message_content: The user's message
+        conversation_history: Previous messages in the conversation
+        callback_url: URL for the AI service to send responses to
+        file_contents: Optional list of file contents to include with the message
     """
     should_add_message = True
     if conversation_history:
@@ -61,6 +68,7 @@ def send_to_ai_service(
             "content": message_content
         })
 
+    # Create the request data for the AI service
     request_data = {
         "chat_history": {
             "messages": messages
@@ -70,6 +78,11 @@ def send_to_ai_service(
         "temperature": getattr(settings, 'AI_SERVICE_TEMPERATURE', 0.7),
         "stream_chunks": getattr(settings, 'AI_SERVICE_STREAM_CHUNKS', True)
     }
+
+    # Add file contents if provided
+    if file_contents and len(file_contents) > 0:
+        request_data["file_contents"] = file_contents
+        logger.info(f"Including {len(file_contents)} files in AI request")
 
     headers = {
         "Content-Type": "application/json",
@@ -81,11 +94,17 @@ def send_to_ai_service(
         logger.info(f"Sending request to AI service endpoint: {endpoint}")
         logger.info(f"With callback URL: {callback_url}")
 
+        # Log file content info if provided
+        if file_contents:
+            for i, file_data in enumerate(file_contents):
+                logger.info(
+                    f"File {i + 1}: {file_data.get('name', 'unknown')} - {len(file_data.get('content', ''))} chars")
+
         response = requests.post(
             endpoint,
             json=request_data,
             headers=headers,
-            timeout=10
+            timeout=30
         )
 
         logger.info(f"AI service response status: {response.status_code}")

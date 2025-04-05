@@ -53,6 +53,11 @@ def process_file(file_id: str) -> Optional[str]:
         api_url = urljoin(settings.PREVIEW_SERVICE_URL, "/process_file/")
 
         try:
+            # Check if file exists
+            if not os.path.exists(file.path):
+                logger.error(f"File path {file.path} does not exist")
+                return None
+
             # Open file
             with open(file.path, "rb") as f:
                 # Get the original filename
@@ -67,12 +72,34 @@ def process_file(file_id: str) -> Optional[str]:
                     "Accept": "application/json",
                 }
 
-                # Send request with timeout
-                logger.info(f"Sending file {file_id} ({original_name}) to preview service")
-                response = requests.post(api_url, files=files, headers=headers, timeout=60)
+                # Send request with retry and timeout
+                max_retries = 3
+                retry_count = 0
+                response = None
+
+                while retry_count < max_retries:
+                    try:
+                        logger.info(
+                            f"Sending file {file_id} ({original_name}) to preview service (attempt {retry_count + 1})")
+                        response = requests.post(api_url, files=files, headers=headers, timeout=60)
+                        break
+                    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                        retry_count += 1
+                        if retry_count >= max_retries:
+                            logger.error(f"Failed to connect to preview service after {max_retries} attempts: {str(e)}")
+                            return None
+                        logger.warning(f"Retry {retry_count} for file {file_id}: {str(e)}")
+                        time.sleep(2)  # Wait before retry
+
+                if not response:
+                    logger.error(f"No response received from preview service for file {file_id}")
+                    return None
 
                 if response.status_code != 200:
                     logger.error(f"Failed to process file {file_id}: {response.text}")
+                    # Update file status to indicate processing failed
+                    file.status = "FAILED"
+                    db.commit()
                     return None
 
                 # Process response
@@ -80,7 +107,12 @@ def process_file(file_id: str) -> Optional[str]:
                 logger.debug(f"Preview service response for file {file_id}: {json.dumps(result, default=str)[:200]}...")
 
                 # Update file type if provided
-                file_type = FileType(result["file_type"]) if "file_type" in result else None
+                file_type = None
+                if "file_type" in result:
+                    try:
+                        file_type = FileType(result["file_type"])
+                    except ValueError:
+                        logger.warning(f"Unknown file type: {result['file_type']}")
 
                 # Extract and sanitize content
                 content = sanitize_content(result.get("content", ""))
@@ -107,14 +139,22 @@ def process_file(file_id: str) -> Optional[str]:
                     except Exception as e:
                         logger.error(f"Error saving preview for file {file_id}: {str(e)}", exc_info=True)
 
+                # Mark file as processed successfully
+                file.status = "PROCESSED"
+                db.commit()
+
                 logger.info(f"File {file_id} processed successfully")
                 return file_id
 
         except requests.RequestException as e:
             logger.error(f"Request error processing file {file_id}: {str(e)}", exc_info=True)
+            file.status = "FAILED"
+            db.commit()
             return None
         except IOError as e:
             logger.error(f"IO error processing file {file_id}: {str(e)}", exc_info=True)
+            file.status = "FAILED"
+            db.commit()
             return None
 
     except Exception as e:

@@ -122,6 +122,7 @@ class Chat(ChatBase):
     created_at: datetime
     updated_at: datetime
     messages: Optional[List[Message]] = []
+    suggestions: Optional[List[str]] = []
 
     class Config:
         from_attributes = True

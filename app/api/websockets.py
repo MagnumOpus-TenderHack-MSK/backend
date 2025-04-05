@@ -6,6 +6,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException, status, Depends, Query
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 from starlette.websockets import WebSocketState
 
 from app.core.security import validate_token
@@ -129,7 +130,9 @@ async def websocket_endpoint(
         connection_key = f"{chat_id}:{user_id}"
 
         # Check if chat exists and user has access
-        chat = db.query(Chat).filter(Chat.id == chat_id).first()
+        chat = await run_in_threadpool(
+            lambda: db.query(Chat).filter(Chat.id == chat_id).first()
+        )
         if not chat:
             logger.warning(f"Chat {chat_id} not found for WebSocket connection")
             await safe_close_websocket(websocket, code=1008)

@@ -199,3 +199,16 @@ class Source(Base):
 
     def __repr__(self):
         return f"<Source {self.title} for {self.message_id}>"
+
+class DocumentReference(Base):
+    """Document reference model for linking documents in AI responses."""
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String, nullable=False)
+    num = Column(Integer, nullable=True)
+    path = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<DocumentReference {self.name}>"

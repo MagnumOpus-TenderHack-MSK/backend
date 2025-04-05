@@ -2,11 +2,12 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from app.core.dependencies import get_current_admin_user
 from app.db.models import Chat, Message, Reaction, User
 from app.db.session import get_db
 from sqlalchemy import func, case, text
+from app.schemas.chat import ChatList
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
 logger = logging.getLogger(__name__)
@@ -48,11 +49,12 @@ all_sub_clusters.append('Бессмысленный запрос')
 def get_clusters_stats(
         db: Session = Depends(get_db),
         current_admin=Depends(get_current_admin_user),
-        parent_cluster: str = None
+        parent_cluster: str = Query(None, alias="parentCluster")
 ) -> Dict[str, Any]:
     """
     Get statistics about clusters and sub-clusters used in chats.
-    If parent_cluster is provided, returns sub-clusters for that cluster.
+    If a parent cluster is provided (via the query parameter "parentCluster"),
+    returns only the child (sub) clusters for that parent.
     """
     try:
         chats = db.query(Chat).all()
@@ -72,12 +74,11 @@ def get_clusters_stats(
                             if sub in subcategory_counts:
                                 subcategory_counts[sub] += 1
 
-                # CRITICAL: Filter out zero values completely
+                # Filter out zero values completely
                 filtered_subcategories = {sub: count for sub, count in subcategory_counts.items() if count > 0}
 
-                # If all values are zero, provide minimal sample data
+                # If all counts are zero, provide minimal sample data
                 if not filtered_subcategories:
-                    # Generate some sample data
                     sample_data = []
                     for i, sub in enumerate(subcategories[:3]):
                         sample_data.append({
@@ -87,7 +88,7 @@ def get_clusters_stats(
                         })
                     return {"sub_clusters": sample_data}
 
-                # Convert to list format for API response - ONLY NON-ZERO VALUES
+                # Convert to list format for API response – only non-zero values
                 sub_stats = [
                     {"name": sub, "requests": count, "color": "#" + format(hash(sub) % 0xFFFFFF, '06x')}
                     for sub, count in filtered_subcategories.items()
@@ -111,12 +112,11 @@ def get_clusters_stats(
                         if cat in category_counts:
                             category_counts[cat] += 1
 
-            # CRITICAL: Filter out zero values completely
+            # Filter out zero values completely
             filtered_categories = {cat: count for cat, count in category_counts.items() if count > 0}
 
-            # If all values are zero, provide minimal sample data
+            # If all counts are zero, provide minimal sample data
             if not filtered_categories:
-                # Generate some sample data
                 sample_data = []
                 for i, cat in enumerate(general_clusters[:5]):
                     sample_data.append({
@@ -180,13 +180,7 @@ def get_cluster_timeseries(
         start_datetime = datetime.strptime(f"{start_date} 00:00:00", "%Y-%m-%d %H:%M:%S")
         end_datetime = datetime.strptime(f"{end_date} 23:59:59", "%Y-%m-%d %H:%M:%S")
 
-        # Simple working approach without complex SQL generation
-        # Fetch all chats in the date range
-        chats = db.query(Chat).filter(
-            Chat.created_at.between(start_datetime, end_datetime)
-        ).all()
-
-        # Format function based on granularity
+        # Determine time formatting based on granularity
         if granularity == "hour":
             time_format = lambda dt: dt.strftime("%Y-%m-%d %H:00")
         elif granularity == "week":
@@ -194,89 +188,67 @@ def get_cluster_timeseries(
         else:  # Default to day
             time_format = lambda dt: dt.strftime("%Y-%m-%d")
 
-        # Generate time slots between start and end date
+        # Generate time slots between start and end dates
         time_slots = []
         current = start_datetime
         while current <= end_datetime:
             time_slots.append(time_format(current))
-            # Increment based on granularity
             if granularity == "hour":
                 current += timedelta(hours=1)
             elif granularity == "week":
                 current += timedelta(weeks=1)
-            else:  # day
+            else:
                 current += timedelta(days=1)
 
-        # Initialize the timeseries data structure with zeros
-        timeseries = {}
-        for slot in time_slots:
-            timeseries[slot] = {"date": slot}
-            # Don't pre-fill with zeros - we'll only add entries for non-zero values
+        # Initialize timeseries structure (only non-zero entries will be added)
+        timeseries = {slot: {"date": slot} for slot in time_slots}
 
         # Process chats and count by cluster
+        chats = db.query(Chat).filter(Chat.created_at.between(start_datetime, end_datetime)).all()
         for chat in chats:
-            if not chat.categories:  # Skip if no categories
+            if not chat.categories:
                 continue
-
-            # Get the formatted time slot for this chat
             chat_slot = time_format(chat.created_at)
             if chat_slot not in timeseries:
-                continue  # Skip if somehow out of range
-
-            # Increment counts for each category
+                continue
             for category in chat.categories:
                 if category in general_clusters:
-                    # Initialize the category counter if it doesn't exist yet
                     if category not in timeseries[chat_slot]:
                         timeseries[chat_slot][category] = 0
                     timeseries[chat_slot][category] += 1
 
-        # Convert to list format sorted by date
         result = list(timeseries.values())
         result.sort(key=lambda x: x["date"])
 
-        # If no data at all, return sample data
-        if not result:
-            sample_data = generate_sample_timeseries_data(start_datetime, end_datetime, granularity)
-            return sample_data
+        if not result or all(len(entry) <= 1 for entry in result):
+            result = generate_sample_timeseries_data(start_datetime, end_datetime, granularity)
 
-        # Ensure we have at least some data points
-        if all(len(entry) <= 1 for entry in result):  # Only date field, no actual data
-            sample_data = generate_sample_timeseries_data(start_datetime, end_datetime, granularity)
-            return sample_data
-
-        # CRITICAL: Do NOT filter out time slots, instead keep all time slots but only add categories with non-zero values
         return result
 
     except Exception as e:
         logger.error(f"Error in cluster timeseries: {str(e)}", exc_info=True)
-        sample_data = generate_sample_timeseries_data(start_datetime, end_datetime, granularity)
-        return sample_data
+        return generate_sample_timeseries_data(start_datetime, end_datetime, granularity)
 
 
 def generate_sample_timeseries_data(start_date, end_date, granularity):
     """Generate sample timeseries data with the correct format"""
     sample_data = []
     current = start_date
-    categories = general_clusters[:3]  # Use just a few categories for sample data
-
+    categories = general_clusters[:3]
     while current <= end_date:
         if granularity == "hour":
             time_str = current.strftime("%Y-%m-%d %H:00")
-            current += timedelta(hours=4)  # Skip hours to reduce sample data size
+            current += timedelta(hours=4)
         elif granularity == "week":
             time_str = current.strftime("%Y-%m-%d")
             current += timedelta(weeks=1)
-        else:  # day
+        else:
             time_str = current.strftime("%Y-%m-%d")
             current += timedelta(days=1)
-
         data_point = {"date": time_str}
         for i, category in enumerate(categories):
-            data_point[category] = (i + 1) * (hash(time_str) % 3 + 1)  # Some random-ish but stable data
-
+            data_point[category] = (i + 1) * (hash(time_str) % 3 + 1)
         sample_data.append(data_point)
-
     return sample_data
 
 
@@ -292,31 +264,24 @@ def get_feedback_stats(
     Returns feedback stats with specified granularity.
     """
     try:
-        # Set default date range if not provided
         today = datetime.utcnow().date()
-
         if from_date:
             start_date = datetime.strptime(f"{from_date} 00:00:00", "%Y-%m-%d %H:%M:%S")
         else:
             start_date = datetime.combine(today - timedelta(days=1), datetime.min.time())
-
         if to_date:
             end_date = datetime.strptime(f"{to_date} 23:59:59", "%Y-%m-%d %H:%M:%S")
         else:
             end_date = datetime.combine(today, datetime.max.time())
-
-        # Define time format based on granularity
         if granularity == "hour":
             time_format = "date_trunc('hour', m.created_at)"
             formatter = lambda dt: dt.strftime("%Y-%m-%d %H:00")
         elif granularity == "week":
             time_format = "date_trunc('week', m.created_at)"
             formatter = lambda dt: dt.strftime("%Y-%m-%d")
-        else:  # Default to day
+        else:
             time_format = "date_trunc('day', m.created_at)"
             formatter = lambda dt: dt.strftime("%Y-%m-%d")
-
-        # Use SQL with consistent parameter binding style - using named parameters with :name
         query = text(f"""
             WITH time_series AS (
                 SELECT generate_series(
@@ -348,60 +313,114 @@ def get_feedback_stats(
             GROUP BY time_series.time_slot
             ORDER BY time_series.time_slot
         """)
-
         result = db.execute(query, {
             "start_date": start_date,
             "end_date": end_date,
             "granularity": granularity
         }).fetchall()
-
-        # Transform into list of dictionaries
         feedback_data = []
         for row in result:
-            # CRITICAL: Only include time points that have at least one reaction
             if row['likes'] > 0 or row['dislikes'] > 0:
                 feedback_data.append({
                     "date": formatter(row['time_slot']),
                     "likes": int(row['likes']),
                     "dislikes": int(row['dislikes']),
                 })
-
-        # If no data at all, provide sample data
         if not feedback_data:
             feedback_data = generate_sample_feedback_data(start_date, end_date, granularity)
-
         return feedback_data
 
     except Exception as e:
         logger.error(f"Error getting feedback stats: {str(e)}", exc_info=True)
-        sample_data = generate_sample_feedback_data(start_date, end_date, granularity)
-        return sample_data
+        return generate_sample_feedback_data(start_date, end_date, granularity)
 
 
 def generate_sample_feedback_data(start_date, end_date, granularity):
     """Generate sample feedback data with realistic format"""
     sample_data = []
     current = start_date
-
     while current <= end_date:
         if granularity == "hour":
             time_str = current.strftime("%Y-%m-%d %H:00")
-            current += timedelta(hours=4)  # Skip hours to reduce sample data size
+            current += timedelta(hours=4)
         elif granularity == "week":
             time_str = current.strftime("%Y-%m-%d")
             current += timedelta(weeks=1)
-        else:  # day
+        else:
             time_str = current.strftime("%Y-%m-%d")
             current += timedelta(days=1)
-
-        # Ensure we have some non-zero values
         likes = max(1, hash(time_str) % 5)
         dislikes = max(0, (hash(time_str) // 10) % 3)
-
         sample_data.append({
             "date": time_str,
             "likes": likes,
             "dislikes": dislikes,
         })
-
     return sample_data
+
+
+@router.get("/stats")
+def get_admin_stats(
+        db: Session = Depends(get_db),
+        current_admin=Depends(get_current_admin_user)
+) -> Dict[str, Any]:
+    """
+    Get admin dashboard statistics.
+    """
+    try:
+        total_users = db.query(User).count()
+        week_ago = datetime.utcnow() - timedelta(days=7)
+        active_chats = db.query(Chat).filter(Chat.updated_at >= week_ago).count()
+        positive_reactions = db.query(Reaction).filter(Reaction.reaction_type == "like").count()
+        negative_reactions = db.query(Reaction).filter(Reaction.reaction_type == "dislike").count()
+        return {
+            "totalUsers": total_users,
+            "activeChats": active_chats,
+            "positiveReactions": positive_reactions,
+            "negativeReactions": negative_reactions,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error getting admin stats: {str(e)}", exc_info=True)
+        return {
+            "totalUsers": 0,
+            "activeChats": 0,
+            "positiveReactions": 0,
+            "negativeReactions": 0,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+
+@router.get("/chats", response_model=ChatList)
+def get_admin_chats(
+    skip: int = 0,
+    limit: int = 100,
+    cluster: Optional[str] = Query(None),
+    subCluster: Optional[str] = Query(None, alias="subCluster"),
+    from_date: Optional[str] = Query(None, alias="from"),
+    to_date: Optional[str] = Query(None, alias="to"),
+    db: Session = Depends(get_db),
+    current_admin=Depends(get_current_admin_user),
+):
+    """
+    Get chats filtered by cluster and subCluster for admin.
+    If a subCluster is provided, return chats that belong to that child cluster;
+    otherwise, if a cluster is provided, filter by the parent cluster.
+    Optionally, filter by a creation date range.
+    """
+    query = db.query(Chat)
+    if from_date and to_date:
+        try:
+            start_date = datetime.strptime(from_date, "%Y-%m-%d")
+            end_date = datetime.strptime(to_date, "%Y-%m-%d")
+            query = query.filter(Chat.created_at.between(start_date, end_date))
+        except Exception as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="Invalid date format. Use YYYY-MM-DD.")
+    if subCluster:
+        query = query.filter(Chat.subcategories.any(subCluster))
+    elif cluster:
+        query = query.filter(Chat.categories.any(cluster))
+    total = query.count()
+    chats = query.order_by(Chat.created_at.desc()).offset(skip).limit(limit).all()
+    return ChatList(items=chats, total=total)

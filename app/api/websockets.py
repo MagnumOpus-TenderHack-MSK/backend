@@ -356,8 +356,13 @@ async def broadcast_message_chunk(chat_id: UUID, user_id: UUID, message_id: UUID
     await broadcast_message(chat_id, user_id, message)
 
 
-async def broadcast_message_complete(chat_id: UUID, user_id: UUID, message_id: UUID,
-                                     sources: List[Dict[str, Any]] = None):
+async def broadcast_message_complete(
+        chat_id: UUID,
+        user_id: UUID,
+        message_id: UUID,
+        sources: List[Dict[str, Any]] = None,
+        suggestions: List[str] = None
+):
     """Broadcast message completion to all connections for a chat."""
     message = {
         "type": "complete",
@@ -366,6 +371,10 @@ async def broadcast_message_complete(chat_id: UUID, user_id: UUID, message_id: U
 
     if sources:
         message["sources"] = sources
+
+    if suggestions:
+        message["suggestions"] = suggestions
+        logger.info(f"Including {len(suggestions)} suggestions in completion message")
 
     logger.info(f"Broadcasting completion for message {message_id} to chat {chat_id}, user {user_id}")
     await broadcast_message(chat_id, user_id, message)

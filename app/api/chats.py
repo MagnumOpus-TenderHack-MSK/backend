@@ -455,6 +455,7 @@ def add_message_reaction(
         )
 
 
+
 @router.post("/{chat_id}/messages/{message_id}/callback")
 async def message_callback(
         chat_id: UUID,
@@ -464,13 +465,6 @@ async def message_callback(
 ):
     """
     Callback endpoint for AI service to send message chunks.
-    This endpoint accepts JSON responses in the following format:
-    {
-        "chunk_id": "<chunk_id>",
-        "content": "<content>",
-        "is_final": <True/False>,
-        "context_used": [ ... ]
-    }
     """
     logger.info(f"Received callback for chat {chat_id}, message {message_id}")
     logger.debug(f"Callback data: {json.dumps(data, default=str)[:500]}")
@@ -531,7 +525,11 @@ async def message_callback(
             sources=context_used
         )
 
-        # Send complete notification to client
-        await broadcast_message_complete(chat_id, user_id, message_id, context_used)
+        # Get the chat's suggestions for broadcasting
+        suggestions = chat_obj.suggestions if chat_obj else []
+        logger.info(f"Retrieved {len(suggestions) if suggestions else 0} suggestions from chat")
+
+        # Send complete notification to client with suggestions
+        await broadcast_message_complete(chat_id, user_id, message_id, context_used, suggestions)
 
     return {"status": "success"}

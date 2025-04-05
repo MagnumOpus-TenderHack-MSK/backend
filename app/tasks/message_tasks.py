@@ -28,20 +28,42 @@ def save_completed_message(message_id: str, content: str, sources: Optional[List
     """
     db = SessionLocal()
     try:
-        # Update message in database
-        message = update_ai_message(
-            db=db,
-            message_id=message_id,
-            content=content,
-            status=MessageStatus.COMPLETED,
-            sources=sources
-        )
+        # Log all incoming parameters for debugging
+        logger.info(f"save_completed_message called for message_id: {message_id}")
+        logger.info(f"Content length: {len(content)}")
+        logger.debug(f"Content preview: {content[:100]}..." if len(content) > 100 else f"Content: {content}")
 
-        logger.info(f"Message {message_id} saved successfully")
-        return message_id
+        if sources:
+            logger.info(f"Sources provided: {len(sources)}")
+            logger.debug(f"First source: {json.dumps(sources[0], default=str)}" if sources else "No sources")
+
+        # Get the message from database to verify it exists
+        message = db.query(Message).filter(Message.id == message_id).first()
+        if not message:
+            logger.error(f"Message {message_id} not found in database")
+            return None
+
+        # Update message in database
+        try:
+            message = update_ai_message(
+                db=db,
+                message_id=message_id,
+                content=content,
+                status=MessageStatus.COMPLETED,
+                sources=sources
+            )
+            logger.info(f"Message {message_id} saved successfully")
+
+            # Log chat information for context
+            logger.info(f"Message belongs to chat {message.chat_id}")
+
+            return message_id
+        except Exception as e:
+            logger.error(f"Error updating message in database: {str(e)}", exc_info=True)
+            raise
 
     except Exception as e:
-        logger.error(f"Error saving message {message_id}: {str(e)}")
+        logger.error(f"Error saving message {message_id}: {str(e)}", exc_info=True)
         return None
 
     finally:
@@ -70,7 +92,7 @@ def update_message_status(message_id: str, status: str) -> Optional[str]:
         return message_id
 
     except Exception as e:
-        logger.error(f"Error updating message {message_id} status: {str(e)}")
+        logger.error(f"Error updating message {message_id} status: {str(e)}", exc_info=True)
         return None
 
     finally:
@@ -98,7 +120,7 @@ async def save_message_chunk_to_redis(message_id: str, chunk: str) -> bool:
         return True
 
     except Exception as e:
-        logger.error(f"Error saving message chunk to Redis: {str(e)}")
+        logger.error(f"Error saving message chunk to Redis: {str(e)}", exc_info=True)
         return False
 
 
@@ -117,8 +139,12 @@ async def get_message_content_from_redis(message_id: str) -> str:
 
         await redis.close()
 
-        return content.decode('utf-8') if content else ""
+        if content:
+            return content.decode('utf-8')
+        else:
+            logger.warning(f"No content found in Redis for message {message_id}")
+            return ""
 
     except Exception as e:
-        logger.error(f"Error getting message content from Redis: {str(e)}")
+        logger.error(f"Error getting message content from Redis: {str(e)}", exc_info=True)
         return ""

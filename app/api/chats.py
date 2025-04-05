@@ -1,3 +1,4 @@
+import json
 import logging
 
 from typing import List, Optional, Dict, Any
@@ -6,6 +7,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Body
 from sqlalchemy.orm import Session
 
+from app.api.websockets import broadcast_message_chunk, broadcast_message_complete
 from app.core.dependencies import get_current_active_user, get_chat_by_id
 from app.db.session import get_db
 from app.db.models import User, Chat, Message, MessageStatus
@@ -19,7 +21,9 @@ from app.schemas.chat import (
     ReactionCreate
 )
 from app.services import chat_service, ai_service
-from app.tasks.message_tasks import update_message_status, save_completed_message
+from app.tasks.message_tasks import update_message_status, save_completed_message, get_message_content_from_redis, \
+    save_message_chunk_to_redis
+from app.core.config import settings
 
 router = APIRouter(prefix="/chats", tags=["Chats"])
 logger = logging.getLogger(__name__)
@@ -35,13 +39,26 @@ def get_chats(
     """
     Get all chats for the current user.
     """
-    chats = chat_service.get_chats(
-        db=db,
-        user_id=current_user.id,
-        skip=skip,
-        limit=limit
-    )
-    return chats
+    try:
+        logger.info(f"Getting chats for user {current_user.id}")
+        chats_data = chat_service.get_chats(
+            db=db,
+            user_id=current_user.id,
+            skip=skip,
+            limit=limit
+        )
+
+        # Manually convert items to create the ChatList
+        chat_items = [ChatSchema.from_orm(chat) for chat in chats_data["items"]]
+
+        logger.info(f"Successfully fetched {len(chat_items)} chats")
+        return ChatList(
+            items=chat_items,
+            total=chats_data["total"]
+        )
+    except Exception as e:
+        logger.error(f"Error in get_chats endpoint: {str(e)}", exc_info=True)
+        raise
 
 
 @router.post("", response_model=ChatSchema, status_code=status.HTTP_201_CREATED)
@@ -53,12 +70,18 @@ def create_chat(
     """
     Create a new chat.
     """
-    chat = chat_service.create_chat(
-        db=db,
-        user_id=current_user.id,
-        chat_data=chat_data
-    )
-    return chat
+    try:
+        logger.info(f"Creating new chat for user {current_user.id} with title: {chat_data.title}")
+        chat = chat_service.create_chat(
+            db=db,
+            user_id=current_user.id,
+            chat_data=chat_data
+        )
+        logger.info(f"Successfully created chat {chat.id}")
+        return chat
+    except Exception as e:
+        logger.error(f"Error creating chat: {str(e)}", exc_info=True)
+        raise
 
 
 @router.get("/{chat_id}", response_model=ChatSchema)
@@ -68,6 +91,7 @@ def get_chat(
     """
     Get a specific chat by ID.
     """
+    logger.info(f"Fetching chat {chat.id}")
     return chat
 
 
@@ -81,13 +105,26 @@ def get_messages(
     """
     Get all messages for a chat.
     """
-    messages = chat_service.get_messages(
-        db=db,
-        chat_id=chat.id,
-        skip=skip,
-        limit=limit
-    )
-    return messages
+    try:
+        logger.info(f"Getting messages for chat {chat.id}")
+        messages_data = chat_service.get_messages(
+            db=db,
+            chat_id=chat.id,
+            skip=skip,
+            limit=limit
+        )
+
+        # Manually convert items to create the MessageList
+        message_items = [MessageSchema.from_orm(msg) for msg in messages_data["items"]]
+
+        logger.info(f"Successfully fetched {len(message_items)} messages")
+        return MessageList(
+            items=message_items,
+            total=messages_data["total"]
+        )
+    except Exception as e:
+        logger.error(f"Error getting messages: {str(e)}", exc_info=True)
+        raise
 
 
 @router.post("/{chat_id}/messages", response_model=MessageSchema)
@@ -101,18 +138,22 @@ async def create_message(
     Create a new message in a chat.
     """
     try:
+        logger.info(f"Creating message in chat {chat.id}: {message_data.content[:30]}...")
+
         # Create user message
         user_message = chat_service.create_user_message(
             db=db,
             chat_id=chat.id,
             message_data=message_data
         )
+        logger.info(f"Created user message {user_message.id}")
 
         # Create AI message (pending)
         ai_message = chat_service.create_ai_message(
             db=db,
             chat_id=chat.id
         )
+        logger.info(f"Created pending AI message {ai_message.id}")
 
         # Get conversation history
         messages = chat.messages
@@ -120,15 +161,19 @@ async def create_message(
         # Prepare conversation history for AI service
         conversation_history = ai_service.prepare_conversation_history(messages)
 
-        # Create callback URL
+        # Get host from request or settings
         host = str(request.base_url).rstrip('/')
+
+        # Create callback URL - ai_service will use CALLBACK_HOST if set, otherwise use request host
         callback_url = ai_service.create_callback_url(
             host=host,
             chat_id=chat.id,
             message_id=ai_message.id
         )
+        logger.info(f"Callback URL created: {callback_url}")
 
         # Send message to AI service
+        logger.info("Sending message to AI service")
         success = ai_service.send_to_ai_service(
             message_content=message_data.content,
             conversation_history=conversation_history,
@@ -137,11 +182,13 @@ async def create_message(
 
         # Update message status based on AI service response
         if success:
+            logger.info(f"Message sent to AI service, updating status to PROCESSING")
             update_message_status.delay(
                 message_id=str(ai_message.id),
                 status=MessageStatus.PROCESSING
             )
         else:
+            logger.error("Failed to send message to AI service")
             update_message_status.delay(
                 message_id=str(ai_message.id),
                 status=MessageStatus.FAILED
@@ -176,26 +223,39 @@ def add_message_reaction(
     """
     Add a reaction to a message.
     """
-    # Check if message exists and belongs to this chat
-    message = db.query(Message).filter(
-        Message.id == message_id,
-        Message.chat_id == chat.id
-    ).first()
+    try:
+        logger.info(f"Adding reaction {reaction_data.reaction_type} to message {message_id}")
 
-    if not message:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Message not found"
+        # Check if message exists and belongs to this chat
+        message = db.query(Message).filter(
+            Message.id == message_id,
+            Message.chat_id == chat.id
+        ).first()
+
+        if not message:
+            logger.warning(f"Message {message_id} not found in chat {chat.id}")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Message not found"
+            )
+
+        # Add reaction
+        reaction = chat_service.add_reaction(
+            db=db,
+            message_id=message_id,
+            reaction_data=reaction_data
         )
+        logger.info(f"Added reaction successfully")
 
-    # Add reaction
-    reaction = chat_service.add_reaction(
-        db=db,
-        message_id=message_id,
-        reaction_data=reaction_data
-    )
-
-    return {"status": "success"}
+        return {"status": "success"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error adding reaction: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to add reaction"
+        )
 
 
 @router.post("/{chat_id}/messages/{message_id}/callback")
@@ -207,7 +267,17 @@ async def message_callback(
 ):
     """
     Callback endpoint for AI service to send message chunks.
+    This endpoint now accepts JSON responses in the following format only:
+    {
+        "chunk_id": "<chunk_id>",
+        "content": "<content>",
+        "is_final": <True/False>,
+        "context_used": [ ... ]
+    }
     """
+    logger.info(f"Received callback for chat {chat_id}, message {message_id}")
+    logger.debug(f"Callback data: {json.dumps(data, default=str)[:500]}")
+
     # Check if message exists
     message = db.query(Message).filter(
         Message.id == message_id,
@@ -215,55 +285,51 @@ async def message_callback(
     ).first()
 
     if not message:
+        logger.error(f"Message {message_id} not found for chat {chat_id}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Message not found"
         )
 
-    # Check data type
-    if "type" not in data:
+    # Validate that data contains the expected keys
+    required_keys = ["chunk_id", "content", "is_final", "context_used"]
+    if not all(key in data for key in required_keys):
+        logger.error("Callback data missing required keys")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Missing data type"
+            detail="Invalid callback format"
         )
 
-    # Handle different callback types
-    if data["type"] == "chunk":
-        # Handle message chunk
-        if "content" not in data:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Missing chunk content"
-            )
+    # Determine user_id for broadcasting
+    chat_obj = db.query(Chat).filter(Chat.id == chat_id).first()
+    user_id = chat_obj.user_id if chat_obj else None
+    if not user_id:
+        logger.error(f"Could not determine user_id for chat {chat_id}")
+        user_id = UUID("00000000-0000-0000-0000-000000000000")  # Fallback
 
-        # Save to Redis for WebSocket streaming
-        from app.tasks.message_tasks import save_message_chunk_to_redis
-        await save_message_chunk_to_redis(str(message_id), data["content"])
+    content = data.get("content", "")
+    is_final = data.get("is_final", False)
+    context_used = data.get("context_used", [])
 
-        return {"status": "success"}
+    # Append this chunk to Redis (or similar) so that chunks accumulate
+    await save_message_chunk_to_redis(str(message_id), content)
+    await broadcast_message_chunk(chat_id, user_id, message_id, content)
 
-    elif data["type"] == "complete":
-        # Handle complete message
-        if "content" not in data:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Missing message content"
-            )
-
-        # Get sources if available
-        sources = data.get("sources", [])
-
-        # Save complete message
+    if is_final:
+        # Retrieve the full accumulated message content
+        full_content = await get_message_content_from_redis(str(message_id))
+        message = db.query(Message).filter(Message.id == message_id, Message.chat_id == chat_id).first()
+        if not message:
+            raise HTTPException(status_code=404, detail="Message not found")
+        message.content = full_content
+        message.status = MessageStatus.COMPLETED
+        db.commit()
+        db.refresh(message)
         save_completed_message.delay(
             message_id=str(message_id),
-            content=data["content"],
-            sources=sources
+            content=full_content,
+            sources=context_used
         )
+        await broadcast_message_complete(chat_id, user_id, message_id, context_used)
+    return {"status": "success"}
 
-        return {"status": "success"}
-
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unknown data type: {data['type']}"
-        )

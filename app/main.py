@@ -19,6 +19,9 @@ logging.basicConfig(
     ]
 )
 
+# Configure SQLAlchemy logging (disable excessive SQL logging)
+logging.getLogger('sqlalchemy.engine').setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 # Create FastAPI app
@@ -29,13 +32,14 @@ app = FastAPI(
     debug=settings.DEBUG
 )
 
-# Add CORS middleware
+# Add CORS middleware with more permissive settings
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Allow all origins
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
+    expose_headers=["Content-Disposition"],  # Expose headers needed for downloads
 )
 
 
@@ -55,8 +59,8 @@ app.include_router(chats.router, prefix="/api")
 app.include_router(files.router, prefix="/api")
 app.include_router(websockets.router)
 
-# Mount static files
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# Mount static files with proper configuration
+app.mount("/static", StaticFiles(directory="static", html=True, check_dir=True), name="static")
 
 
 # Health check
@@ -99,6 +103,82 @@ async def global_exception_handler(request: Request, exc: Exception):
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={"detail": "Internal server error"},
     )
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """
+    Global exception handler for unhandled exceptions.
+    Logs the error and returns a 500 response.
+    """
+    # Get request path and method for context
+    path = request.url.path
+    method = request.method
+
+    # Log the error with context
+    logger.error(f"Unhandled exception on {method} {path}: {str(exc)}", exc_info=True)
+
+    # For API endpoints, return JSON
+    if path.startswith("/api/"):
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "detail": "Internal server error",
+                "path": path,
+                "method": method,
+                "error_type": exc.__class__.__name__
+            },
+        )
+
+    # For non-API endpoints, return a simple error
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "Internal server error"},
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """
+    Enhanced validation error handler.
+    Logs the error and returns a 422 response with detailed validation errors.
+    """
+    path = request.url.path
+    method = request.method
+
+    # Log validation errors
+    logger.warning(f"Validation error on {method} {path}: {exc.errors()}")
+
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "detail": exc.errors(),
+            "path": path,
+            "method": method
+        },
+    )
+
+
+@app.middleware("http")
+async def catch_exceptions_middleware(request: Request, call_next):
+    """
+    Middleware to catch all exceptions and handle them gracefully.
+    """
+    try:
+        return await call_next(request)
+    except Exception as e:
+        # Log the error
+        logger.error(f"Exception in middleware for {request.method} {request.url.path}: {str(e)}", exc_info=True)
+
+        # Return a proper error response
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "detail": "Internal server error occurred",
+                "path": request.url.path,
+                "method": request.method
+            }
+        )
 
 if __name__ == "__main__":
     import uvicorn

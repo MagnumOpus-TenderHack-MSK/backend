@@ -161,11 +161,24 @@ class MessageFile(Base):
 
     # Relationships
     message = relationship("Message", back_populates="files")
-    file = relationship("File", back_populates="message_files")
+    file = relationship("File", back_populates="message_files", lazy="joined")  # Use joined loading
+
+    @property
+    def name(self):
+        return self.file.name if self.file else "Unknown File"
+
+    @property
+    def file_type(self):
+        return self.file.file_type.value if self.file else "OTHER"
+
+    @property
+    def preview_url(self):
+        if self.file and hasattr(self.file, 'preview') and self.file.preview:
+            return f"/api/files/{self.file_id}/preview"
+        return None
 
     def __repr__(self):
         return f"<MessageFile {self.message_id} - {self.file_id}>"
-
 
 class Source(Base):
     """Source model for message sources."""

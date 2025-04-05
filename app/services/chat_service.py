@@ -3,7 +3,7 @@ import logging
 from typing import List, Optional, Dict, Any
 from uuid import UUID
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload, joinedload
 from fastapi import HTTPException, status
 
 from app.db.models import Chat, Message, MessageType, MessageStatus, MessageFile, Source, Reaction, ReactionType, File
@@ -16,15 +16,27 @@ def get_chats(db: Session, user_id: UUID, skip: int = 0, limit: int = 100) -> Di
     """
     Get all chats for a user with pagination.
     """
-    # Get chats with count
-    total = db.query(Chat).filter(Chat.user_id == user_id).count()
-    chats = db.query(Chat).filter(Chat.user_id == user_id).order_by(Chat.updated_at.desc()).offset(skip).limit(
-        limit).all()
+    try:
+        # Log the start of the operation
+        logger.info(f"Fetching chats for user {user_id}, skip={skip}, limit={limit}")
 
-    return {
-        "items": chats,
-        "total": total
-    }
+        # Get total chats count
+        total = db.query(Chat).filter(Chat.user_id == user_id).count()
+        logger.info(f"Total chats found: {total}")
+
+        # Get chats with eager loading of messages and related data
+        chats = db.query(Chat).filter(Chat.user_id == user_id).options(
+            selectinload(Chat.messages).selectinload(Message.files).joinedload(MessageFile.file)
+        ).order_by(Chat.updated_at.desc()).offset(skip).limit(limit).all()
+
+        logger.info(f"Successfully fetched {len(chats)} chats")
+        return {
+            "items": chats,
+            "total": total
+        }
+    except Exception as e:
+        logger.error(f"Error fetching chats for user {user_id}: {str(e)}", exc_info=True)
+        raise
 
 
 def get_chat(db: Session, chat_id: UUID) -> Chat:
@@ -63,15 +75,28 @@ def get_messages(db: Session, chat_id: UUID, skip: int = 0, limit: int = 100) ->
     """
     Get all messages for a chat with pagination.
     """
-    # Get messages with count
-    total = db.query(Message).filter(Message.chat_id == chat_id).count()
-    messages = db.query(Message).filter(Message.chat_id == chat_id).order_by(Message.created_at).offset(skip).limit(
-        limit).all()
+    try:
+        logger.info(f"Fetching messages for chat {chat_id}, skip={skip}, limit={limit}")
 
-    return {
-        "items": messages,
-        "total": total
-    }
+        # Get messages with count
+        total = db.query(Message).filter(Message.chat_id == chat_id).count()
+        logger.info(f"Total messages found: {total}")
+
+        # Get messages with eager loading of files and file data
+        messages = db.query(Message).filter(Message.chat_id == chat_id).options(
+            selectinload(Message.files).joinedload(MessageFile.file),
+            selectinload(Message.reactions),
+            selectinload(Message.sources)
+        ).order_by(Message.created_at).offset(skip).limit(limit).all()
+
+        logger.info(f"Successfully fetched {len(messages)} messages for chat {chat_id}")
+        return {
+            "items": messages,
+            "total": total
+        }
+    except Exception as e:
+        logger.error(f"Error fetching messages for chat {chat_id}: {str(e)}", exc_info=True)
+        raise
 
 
 def create_user_message(db: Session, chat_id: UUID, message_data: MessageCreate) -> Message:
@@ -112,16 +137,6 @@ def create_user_message(db: Session, chat_id: UUID, message_data: MessageCreate)
 
             db.commit()
             db.refresh(message)  # Refresh to get the attached files
-
-        # Process message files for response schema
-        # This is the fix for the validation error
-        if hasattr(message, 'files') and message.files:
-            # Convert MessageFile to FileReference format with necessary fields
-            for msg_file in message.files:
-                if hasattr(msg_file, 'file') and msg_file.file:
-                    # Add required fields that were missing
-                    msg_file.name = msg_file.file.name
-                    msg_file.file_type = msg_file.file.file_type.value
 
         return message
     except Exception as e:

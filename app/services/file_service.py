@@ -44,6 +44,9 @@ def save_upload_file(upload_file: UploadFile, upload_dir: Path) -> Dict[str, Any
     filename = f"{uuid.uuid4()}{os.path.splitext(upload_file.filename)[1]}"
     file_path = upload_dir / filename
 
+    # Ensure directory exists
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
     # Determine MIME type
     content_type = upload_file.content_type
     if not content_type:
@@ -176,3 +179,10 @@ def get_file_preview_url(file_id: UUID) -> str:
     Get preview URL for a file.
     """
     return f"/api/files/{file_id}/preview"
+
+
+def get_file_download_url(file_id: UUID) -> str:
+    """
+    Get download URL for a file.
+    """
+    return f"/api/files/{file_id}/download"

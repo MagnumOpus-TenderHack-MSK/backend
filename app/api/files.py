@@ -170,11 +170,10 @@ def get_file(
 @router.get("/{file_id}/download")
 def download_file(
         file_id: UUID,
-        db: Session = Depends(get_db),
-        current_user: User = Depends(get_current_active_user)
+        db: Session = Depends(get_db)
 ):
     """
-    Download a file.
+    Download a file. Public route - no authentication required.
     """
     file = file_service.get_file(db, file_id)
 
@@ -182,13 +181,6 @@ def download_file(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="File not found"
-        )
-
-    # Check if user has access to this file
-    if file.user_id != current_user.id and not current_user.is_admin:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access forbidden"
         )
 
     return FileResponse(
@@ -201,11 +193,10 @@ def download_file(
 @router.get("/{file_id}/preview")
 def get_file_preview(
         file_id: UUID,
-        db: Session = Depends(get_db),
-        current_user: User = Depends(get_current_active_user)
+        db: Session = Depends(get_db)
 ):
     """
-    Get file preview image.
+    Get file preview image. Public route - no authentication required.
     """
     file = file_service.get_file(db, file_id)
 
@@ -213,13 +204,6 @@ def get_file_preview(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="File not found"
-        )
-
-    # Check if user has access to this file
-    if file.user_id != current_user.id and not current_user.is_admin:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access forbidden"
         )
 
     # Check if preview exists

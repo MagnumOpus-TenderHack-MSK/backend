@@ -1,7 +1,7 @@
 from typing import List, Optional
 from datetime import datetime
 from uuid import UUID
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, root_validator, validator
 
 from app.db.models import MessageType, MessageStatus, ReactionType
 
@@ -47,6 +47,7 @@ class FileReference(BaseModel):
 
     class Config:
         from_attributes = True
+        arbitrary_types_allowed = True
 
 
 class MessageBase(BaseModel):
@@ -74,6 +75,34 @@ class Message(MessageBase):
 
     class Config:
         from_attributes = True
+        arbitrary_types_allowed = True
+
+    @classmethod
+    def from_orm(cls, obj):
+        """Custom from_orm to handle files."""
+        # Create a dict for normal fields
+        obj_dict = {}
+        for field in cls.__fields__:
+            if field != 'files' and hasattr(obj, field):
+                obj_dict[field] = getattr(obj, field)
+
+        # Process files separately
+        if hasattr(obj, 'files') and obj.files:
+            files_data = []
+            for file_ref in obj.files:
+                if hasattr(file_ref, 'file') and file_ref.file:
+                    file_data = {
+                        'id': file_ref.file_id,
+                        'name': file_ref.file.name,
+                        'file_type': file_ref.file.file_type.value,
+                    }
+                    # Add preview URL if available
+                    if hasattr(file_ref.file, 'preview') and file_ref.file.preview:
+                        file_data['preview_url'] = f"/api/files/{file_ref.file_id}/preview"
+                    files_data.append(file_data)
+            obj_dict['files'] = files_data
+
+        return cls(**obj_dict)
 
 
 class ChatBase(BaseModel):

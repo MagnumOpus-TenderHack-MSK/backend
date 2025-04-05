@@ -3,10 +3,12 @@ from typing import Any, Dict, Optional, Union
 
 from jose import jwt
 from passlib.context import CryptContext
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, status, Request
 from fastapi.security import OAuth2PasswordBearer
+from fastapi.security.utils import get_authorization_scheme_param
 
 from app.core.config import settings
+from app.core.auth_utils import should_bypass_auth
 from app.db.session import get_db
 from app.db.models import User
 from sqlalchemy.orm import Session
@@ -14,8 +16,35 @@ from sqlalchemy.orm import Session
 # Password hashing context
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# OAuth2 scheme for token authentication
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+
+# OAuth2 scheme for token authentication with custom function
+class OAuth2PasswordBearerWithCookieAndBypass(OAuth2PasswordBearer):
+    async def __call__(self, request: Request) -> Optional[str]:
+        # Check if the path should bypass authentication
+        if should_bypass_auth(request):
+            return None
+
+        # Try to get token from Authorization header
+        authorization = request.headers.get("Authorization")
+        scheme, param = get_authorization_scheme_param(authorization)
+
+        if not authorization or scheme.lower() != "bearer":
+            # Try to get token from cookies
+            token = request.cookies.get("access_token")
+            if token:
+                return token
+
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Not authenticated",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        return param
+
+
+# Use custom OAuth2 scheme
+oauth2_scheme = OAuth2PasswordBearerWithCookieAndBypass(tokenUrl="/api/auth/login")
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
@@ -63,6 +92,11 @@ async def get_current_user(
     """
     Get the current authenticated user from the JWT token.
     """
+    # Skip authentication for public routes
+    if token is None:
+        # For routes that bypass auth, return None
+        return None
+
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",

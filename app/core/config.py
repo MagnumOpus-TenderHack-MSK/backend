@@ -1,4 +1,5 @@
 import os
+import logging
 from typing import List
 from pathlib import Path
 from pydantic_settings import BaseSettings
@@ -15,6 +16,11 @@ class Settings(BaseSettings):
     APP_PORT: int = 8000
     DEBUG: bool = True
 
+    # Public facing URL for AI service callbacks
+    # If set, this will be used instead of the request base URL for callbacks
+    # Example: "https://api.example.com"
+    CALLBACK_HOST: str = ""
+
     # Database settings
     DB_DRIVER: str = "postgresql"
     DB_HOST: str = "localhost"
@@ -22,6 +28,9 @@ class Settings(BaseSettings):
     DB_USER: str = "postgres"
     DB_PASSWORD: str = "postgres"
     DB_NAME: str = "chat_db"
+
+    # SQLAlchemy settings - disable echo to reduce logging
+    SQLALCHEMY_ECHO: bool = False
 
     # JWT settings
     JWT_SECRET: str
@@ -41,12 +50,16 @@ class Settings(BaseSettings):
     UPLOAD_DIR: str = "static/uploads"
     MAX_UPLOAD_SIZE: int = 10 * 1024 * 1024  # 10 MB
 
-    # External services
-    AI_SERVICE_URL: str
-    AI_SERVICE_API_KEY: str
 
     PREVIEW_SERVICE_URL: str
     PREVIEW_SERVICE_API_KEY: str
+
+    # AI service settings
+    AI_SERVICE_URL: str
+    AI_SERVICE_API_KEY: str
+    AI_SERVICE_MAX_TOKENS: int = 2000
+    AI_SERVICE_TEMPERATURE: float = 0.7
+    AI_SERVICE_STREAM_CHUNKS: bool = True
 
     @property
     def DATABASE_URL(self) -> str:
@@ -76,6 +89,17 @@ class Settings(BaseSettings):
         env_file_encoding = "utf-8"
         case_sensitive = True
 
+
+# Configure logging
+def configure_logging():
+    """Configure logging to reduce noise from SQLAlchemy."""
+    logging.getLogger('sqlalchemy.engine').setLevel(logging.WARNING)
+    logging.getLogger('sqlalchemy.pool').setLevel(logging.WARNING)
+    logging.getLogger('sqlalchemy.orm').setLevel(logging.WARNING)
+
+
+# Configure logging
+configure_logging()
 
 # Create global settings instance
 settings = Settings()

@@ -17,7 +17,6 @@ from app.schemas.user import User as UserSchema # Import base User schema
 router = APIRouter(prefix="/admin", tags=["Admin"])
 logger = logging.getLogger(__name__)
 
-# --- Cluster Mappings (Keep as before) ---
 general_clusters = [
     'Общие вопросы о работе с системой', 'Процессы закупок', 'Работа с контрактами',
     'Оферты и коммерческие предложения', 'Документы', 'Работа с категориями продукции',
@@ -237,29 +236,22 @@ def get_feedback_stats(
         elif granularity == "week":
             time_trunc = "week"
             interval = timedelta(weeks=1)
-            # Correct formatter for week start
             formatter = lambda dt: (dt - timedelta(days=dt.weekday())).strftime("%Y-%m-%d")
         else: # Default to day
             time_trunc = "day"
             interval = timedelta(days=1)
             formatter = lambda dt: dt.strftime("%Y-%m-%d")
 
-        # Generate all expected time slots
         all_slots = set()
         current_slot_start = start_datetime
         while current_slot_start <= end_datetime:
-            # Ensure correct start date for weekly grouping
-            if granularity == 'week':
-                slot_dt = current_slot_start - timedelta(days=current_slot_start.weekday())
-            else:
-                slot_dt = current_slot_start
-            # Truncate based on granularity
+            if granularity == 'week': slot_dt = current_slot_start - timedelta(days=current_slot_start.weekday())
+            else: slot_dt = current_slot_start
             if granularity == 'hour': truncated_dt = slot_dt.replace(minute=0, second=0, microsecond=0)
             elif granularity == 'week': truncated_dt = slot_dt.replace(hour=0, minute=0, second=0, microsecond=0)
             else: truncated_dt = slot_dt.replace(hour=0, minute=0, second=0, microsecond=0)
             all_slots.add(formatter(truncated_dt))
             current_slot_start += interval
-        # Ensure the last possible slot is included
         if granularity == 'week': last_slot_dt = end_datetime - timedelta(days=end_datetime.weekday())
         else: last_slot_dt = end_datetime
         if granularity == 'hour': last_truncated_dt = last_slot_dt.replace(minute=0, second=0, microsecond=0)
@@ -268,14 +260,13 @@ def get_feedback_stats(
         all_slots.add(formatter(last_truncated_dt))
 
 
-        # Query to aggregate reaction counts
         query = text(f"""
             SELECT
                 date_trunc(:granularity, r.created_at) as time_slot,
                 r.reaction_type,
                 count(*) as count
             FROM reaction r
-            JOIN message m ON r.message_id = m.id -- Join to ensure message exists
+            JOIN message m ON r.message_id = m.id
             WHERE r.created_at BETWEEN :start_date AND :end_date
             GROUP BY time_slot, r.reaction_type
             ORDER BY time_slot;
@@ -287,39 +278,42 @@ def get_feedback_stats(
             "end_date": end_datetime
         }).mappings().all()
 
-        # Process results
+        # Optional: Add logging to see raw results before processing
+        logger.debug(f"Raw feedback query results: {results}")
+
+        # --- Process Results ---
         feedback_dict: Dict[str, Dict[str, Any]] = {slot: {"date": slot, "likes": 0, "dislikes": 0} for slot in all_slots}
 
         for row in results:
-            # Ensure time_slot is a datetime object before formatting
             time_slot_dt = row.get('time_slot')
             if not isinstance(time_slot_dt, datetime):
                 logger.warning(f"Skipping row with invalid time_slot type: {time_slot_dt}")
                 continue
 
             slot_str = formatter(time_slot_dt)
-            reaction_type = row['reaction_type']
+
+            # Get reaction type, convert to string, and make lowercase for robust comparison
+            reaction_type_str = str(row['reaction_type']).lower()
             count = row['count']
 
             if slot_str in feedback_dict:
-                # Make sure reaction_type is converted to string for comparison
-                if str(reaction_type) == 'like':
-                    feedback_dict[slot_str]['likes'] += count # Use += to accumulate if needed (though group by should handle this)
-                elif str(reaction_type) == 'dislike':
+                # Compare with lowercase strings 'like' and 'dislike'
+                if reaction_type_str == 'like':
+                    feedback_dict[slot_str]['likes'] += count
+                elif reaction_type_str == 'dislike':
                     feedback_dict[slot_str]['dislikes'] += count
+                else:
+                    logger.warning(f"Unknown reaction type '{row['reaction_type']}' found for slot {slot_str}")
             else:
                  logger.warning(f"Calculated slot '{slot_str}' not found in initial dictionary. Row: {row}")
 
 
-        # Convert to list and sort
         final_feedback = sorted(list(feedback_dict.values()), key=lambda x: x["date"])
 
-        # Filter out entries where both likes and dislikes are zero AFTER processing all results
-        # final_feedback_filtered = [item for item in final_feedback if item["likes"] > 0 or item["dislikes"] > 0]
-
         logger.info(f"Generated feedback data with {len(final_feedback)} points, granularity: {granularity}")
-        # logger.debug(f"Feedback data sample: {final_feedback[:5]}")
-        return final_feedback # Return all slots
+        # logger.debug(f"Final processed feedback data: {final_feedback}") # Optional: log final data
+
+        return final_feedback
 
     except Exception as e:
         logger.error(f"Error getting feedback stats: {str(e)}", exc_info=True)
@@ -512,18 +506,19 @@ def get_admin_chat_detail(
         # Query the chat with eager loading of all related data
         chat = db.query(Chat).options(
             joinedload(Chat.user),
-            selectinload(Chat.messages).options(
-                selectinload(Message.reactions),
-                selectinload(Message.sources),
-                selectinload(Message.files).joinedload(MessageFile.file) # Eager load File via MessageFile
-            ).order_by(Message.created_at) # Order messages within the chat
-        ).filter(Chat.id == chat_id).first()
+            selectinload(Chat.messages).options( # Load messages related options inside this
+                selectinload(Message.reactions), # Eager load reactions for each message
+                selectinload(Message.sources),   # Eager load sources for each message
+                selectinload(Message.files).joinedload(MessageFile.file) # Eager load file data via MessageFile
+            )
+        ).filter(Chat.id == chat_id).first() # Filter and get the single chat
 
         if not chat:
             logger.warning(f"Admin requested non-existent chat: {chat_id}")
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
 
         # Use the AdminChatDetail schema for response validation and serialization
+        # The messages will be ordered based on the model definition
         return AdminChatDetail.from_orm(chat)
 
     except HTTPException as he:

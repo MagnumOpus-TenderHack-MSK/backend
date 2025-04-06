@@ -7,10 +7,10 @@ from fastapi import APIRouter, Depends, HTTPException, status, Request, Body
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
-from app.api.websockets import broadcast_message_chunk, broadcast_message_complete
+from app.api.websockets import broadcast_message_chunk, broadcast_message_complete, broadcast_message
 from app.core.dependencies import get_current_active_user, get_chat_by_id
 from app.db.session import get_db
-from app.db.models import User, Chat, Message, MessageStatus, MessageType, File
+from app.db.models import User, Chat, Message, MessageStatus, MessageType, File, Source
 from app.schemas.chat import (
     Chat as ChatSchema,
     ChatCreate,
@@ -197,32 +197,26 @@ async def create_message(
 ):
     """
     Create a new message in a chat.
+    If the message content indicates a request for support,
+    a system message is created and returned instead of processing with AI.
     """
     try:
-        # Check if this is support request - don't process with AI
         is_support_request = False
         support_keywords = ["оператор", "поддержк", "консультант", "помощник", "специалист"]
 
+        # Check if the message content requests support
         if message_data.content:
             message_lower = message_data.content.lower()
-            # Check if message contains support keywords
             if any(keyword in message_lower for keyword in support_keywords):
                 is_support_request = True
                 logger.info(f"Detected support request: {message_data.content}")
 
-        logger.info(f"Creating message in chat {chat.id}: {message_data.content[:30]}...")
-        user_message = chat_service.create_user_message(
-            db=db,
-            chat_id=chat.id,
-            message_data=message_data
-        )
-        logger.info(f"Created user message {user_message.id}")
-
-        # If this is a support request, create a system message instead of AI message
+        # If this is a support request, create ONLY a system message and return it
         if is_support_request:
             logger.info("Creating system message for support request")
             system_content = "Запрос на соединение с оператором отправлен. Пожалуйста, ожидайте, оператор присоединится к чату в ближайшее время."
 
+            # Use the chat service to create the system message
             system_message = chat_service.create_system_message(
                 db=db,
                 chat_id=chat.id,
@@ -230,33 +224,30 @@ async def create_message(
             )
             logger.info(f"Created system message {system_message.id} for support request")
 
-            return user_message
+            # Return the system message directly
+            return system_message
 
-        # Check if the latest message was a system message about support operator
-        latest_messages = chat.messages[-3:] if chat.messages and len(chat.messages) >= 3 else chat.messages
-        has_system_support_message = False
+        # --- Normal message processing (not a support request) ---
+        logger.info(f"Creating user message in chat {chat.id}: {message_data.content[:30]}...")
+        user_message = chat_service.create_user_message(
+            db=db,
+            chat_id=chat.id,
+            message_data=message_data
+        )
+        logger.info(f"Created user message {user_message.id}")
 
-        if latest_messages:
-            for msg in reversed(latest_messages):  # Check most recent first
-                if msg.message_type == MessageType.SYSTEM and any(
-                        keyword in msg.content.lower() for keyword in support_keywords):
-                    has_system_support_message = True
-                    break
-
-        # If there was a recent system message about support, don't create an AI message
-        if has_system_support_message:
-            logger.info(f"Skipping AI response since there's a support system message")
-            return user_message
-
-        # Create the AI message
+        # Create the AI message (initially pending)
         ai_message = chat_service.create_ai_message(
             db=db,
             chat_id=chat.id
         )
         logger.info(f"Created pending AI message {ai_message.id}")
 
-        # Get conversation history
-        messages = chat.messages
+        # Get conversation history (excluding the AI message we just created)
+        messages = db.query(Message).filter(
+            Message.chat_id == chat.id,
+            Message.id != ai_message.id
+        ).order_by(Message.created_at).all()
         conversation_history = ai_service.prepare_conversation_history(messages)
 
         # Create callback URL
@@ -300,11 +291,7 @@ async def create_message(
                 status=MessageStatus.PROCESSING
             )
 
-            # Update chat title if current title is default
-            if ai_response.get("name") and (chat.title in ["Новый чат", "", None]):
-                chat.title = ai_response["name"]
-                db.commit()
-                logger.info(f"Updated chat title to: {chat.title}")
+            # --- No chat title update here, handled by frontend WebSocket context ---
 
             # Update clusters: map returned subclusters to general clusters
             if ai_response.get("cluster"):
@@ -339,7 +326,9 @@ async def create_message(
                 status=MessageStatus.FAILED
             )
 
+        # Return the user message that triggered the AI response
         return user_message
+
     except HTTPException:
         raise
     except Exception as e:
@@ -351,16 +340,14 @@ async def create_message(
 
 
 @router.post("/{chat_id}/system-messages", response_model=MessageSchema)
-async def create_system_message(
+async def create_system_message_endpoint( # Renamed to avoid conflict
         chat_id: UUID,
         message_data: dict = Body(...),
         db: Session = Depends(get_db),
         current_user: User = Depends(get_current_active_user)
 ):
     """
-    Create a new system message in a chat.
-
-    This endpoint allows for creating system messages like support notifications.
+    Create a new system message in a chat. (Endpoint for external/admin use if needed)
     """
     try:
         # Verify chat exists and user has access
@@ -373,37 +360,34 @@ async def create_system_message(
                 detail="Chat not found"
             )
 
-        # Check if user has access to this chat
+        # Check if user has access to this chat (Only admin or chat owner)
         if chat.user_id != current_user.id and not current_user.is_admin:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Access forbidden"
             )
 
-        # Get content and message type
         content = message_data.get("content")
-        message_type = message_data.get("message_type", "SYSTEM")
-
         if not content:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Content is required"
             )
 
-        # Create system message
+        # Create system message using the service function
         system_message = chat_service.create_system_message(
             db=db,
             chat_id=chat_id,
             content=content
         )
 
-        logger.info(f"Created system message {system_message.id} in chat {chat_id}")
+        logger.info(f"Created system message {system_message.id} in chat {chat_id} via endpoint")
         return system_message
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error creating system message: {str(e)}", exc_info=True)
+        logger.error(f"Error creating system message via endpoint: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to create system message"
@@ -455,7 +439,6 @@ def add_message_reaction(
         )
 
 
-
 @router.post("/{chat_id}/messages/{message_id}/callback")
 async def message_callback(
         chat_id: UUID,
@@ -463,9 +446,6 @@ async def message_callback(
         data: Dict[str, Any] = Body(...),
         db: Session = Depends(get_db)
 ):
-    """
-    Callback endpoint for AI service to send message chunks.
-    """
     logger.info(f"Received callback for chat {chat_id}, message {message_id}")
     logger.debug(f"Callback data: {json.dumps(data, default=str)[:500]}")
 
@@ -500,13 +480,32 @@ async def message_callback(
 
     content = data.get("content", "")
     is_final = data.get("is_final", False)
+    chat_name = data.get("name") # Get potential chat name update
+    suggestions = data.get("suggestions", []) # Get suggestions
+
+    # Get sources from either context_used or content_used
     context_used = data.get("context_used", [])
+    content_used = data.get("content_used", [])
+
+    # Use content_used if available, otherwise fall back to context_used
+    sources_data = content_used if content_used and isinstance(content_used, list) else context_used
 
     # Append this chunk to Redis
     await save_message_chunk_to_redis(str(message_id), content)
 
-    # Send only the new chunk to the client for smooth typing
-    await broadcast_message_chunk(chat_id, user_id, message_id, content)
+    # Prepare chunk data for broadcasting, including potential name update and suggestions
+    broadcast_chunk_data = {
+        "type": "chunk",
+        "message_id": str(message_id),
+        "content": content,
+        # Include chat_name and suggestions only if they exist in the callback data
+        **({"chat_name": chat_name} if chat_name else {}),
+        **({"suggestions": suggestions} if suggestions else {}),
+    }
+
+    # Send only the new chunk (with metadata) to the client
+    await broadcast_message(chat_id, user_id, broadcast_chunk_data)
+
 
     if is_final:
         # Retrieve the full accumulated message content
@@ -518,18 +517,38 @@ async def message_callback(
         db.commit()
         db.refresh(message)
 
-        # Use celery task to process sources and finalize message
-        save_completed_message.delay(
-            message_id=str(message_id),
-            content=full_content,
-            sources=context_used
-        )
+        # Process sources/references if provided
+        if sources_data:
+            # First remove any existing sources
+            db.query(Source).filter(Source.message_id == message_id).delete()
 
-        # Get the chat's suggestions for broadcasting
-        suggestions = chat_obj.suggestions if chat_obj else []
-        logger.info(f"Retrieved {len(suggestions) if suggestions else 0} suggestions from chat")
+            # Then add the new sources
+            for ref in sources_data:
+                ref_id = ref.get("id")
+                source_name = ref.get("source", "")
+                page = ref.get("page")
 
-        # Send complete notification to client with suggestions
-        await broadcast_message_complete(chat_id, user_id, message_id, context_used, suggestions)
+                # Only create source if we have both id and source name
+                if ref_id and source_name:
+                    source = Source(
+                        message_id=message_id,
+                        title=source_name,
+                        content=str(page) if page else None,  # Just store the page number
+                        url=str(ref_id)  # Store reference number in the url field
+                    )
+                    db.add(source)
+
+            # Log created sources
+            logger.info(f"Created {len(sources_data)} sources for message {message_id}")
+            db.commit()
+
+        # Get the chat's final suggestions (could be updated by AI)
+        # Fetch chat again to get potentially updated suggestions stored by the create_message endpoint
+        chat_obj = db.query(Chat).filter(Chat.id == chat_id).first()
+        final_suggestions = chat_obj.suggestions if chat_obj else suggestions # Fallback to suggestions from callback
+        logger.info(f"Retrieved {len(final_suggestions) if final_suggestions else 0} final suggestions from chat")
+
+        # Send complete notification to client with final sources and suggestions
+        await broadcast_message_complete(chat_id, user_id, message_id, sources_data, final_suggestions)
 
     return {"status": "success"}

@@ -25,6 +25,14 @@ def save_completed_message(message_id: str, content: str, sources: Optional[List
     This task:
     1. Updates the message content and status
     2. Adds sources if available
+
+    Args:
+        message_id: The ID of the message
+        content: The complete message content
+        sources: Optional list of source references
+
+    Returns:
+        The message ID if successful, None otherwise
     """
     db = SessionLocal()
     try:
@@ -43,6 +51,22 @@ def save_completed_message(message_id: str, content: str, sources: Optional[List
             logger.error(f"Message {message_id} not found in database")
             return None
 
+        # Process sources if provided
+        processed_sources = []
+        if sources and isinstance(sources, list):
+            for source in sources:
+                # Normalize source data format
+                source_title = source.get("source", "") or source.get("title", "")
+                ref_id = source.get("id", "") or source.get("url", "")
+                page = source.get("page", None)
+
+                if source_title and ref_id:
+                    processed_sources.append({
+                        "title": source_title,
+                        "id": str(ref_id),  # Ensure ID is a string
+                        "page": page  # Pass page as is, will be formatted in update_ai_message
+                    })
+
         # Update message in database
         try:
             message = update_ai_message(
@@ -50,7 +74,7 @@ def save_completed_message(message_id: str, content: str, sources: Optional[List
                 message_id=message_id,
                 content=content,
                 status=MessageStatus.COMPLETED,
-                sources=sources
+                sources=processed_sources
             )
             logger.info(f"Message {message_id} saved successfully")
 

@@ -1,18 +1,23 @@
 import logging
+from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status, Query
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload, selectinload
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
+
 from app.core.dependencies import get_current_admin_user
-from app.db.models import Chat, Message, Reaction, User
+from app.db.models import Chat, Message, Reaction, User, MessageFile, Source # Import missing models
 from app.db.session import get_db
-from sqlalchemy import func, case, text
-from app.schemas.chat import ChatList
+from sqlalchemy import func, case, text, and_
+from app.schemas.chat import ChatList, MessageList # Keep using existing schemas for now
+from app.schemas.admin import AdminChat, AdminChatDetail, AdminUser, PaginatedResponse # Import new admin schemas
+from app.schemas.user import User as UserSchema # Import base User schema
+
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
 logger = logging.getLogger(__name__)
 
-# Hard-coded mappings
+# --- Cluster Mappings (Keep as before) ---
 general_clusters = [
     'Общие вопросы о работе с системой', 'Процессы закупок', 'Работа с контрактами',
     'Оферты и коммерческие предложения', 'Документы', 'Работа с категориями продукции',
@@ -22,8 +27,7 @@ general_clusters = [
 ]
 
 sub_clusters = {
-    'Общие вопросы о работе с системой': ['Регистрация и вход в систему', 'Настройка личного кабинета',
-                                          'Поиск информации'],
+    'Общие вопросы о работе с системой': ['Регистрация и вход в систему', 'Настройка личного кабинета', 'Поиск информации'],
     'Процессы закупок': ['Прямые закупки', 'Котировочные сессии', 'Закупки по потребностям'],
     'Работа с контрактами': ['Формирование и подписание контрактов', 'Исполнение контрактов'],
     'Оферты и коммерческие предложения': ['Создание и редактирование оферт', 'Запросы на коммерческие предложения'],
@@ -33,135 +37,93 @@ sub_clusters = {
     'Чаты и обсуждения': ['Использование чатов', 'Обсуждение конкретных закупок и контрактов'],
     'Финансовые операции': ['Банковские гарантии и финансовые инструменты', 'Логистика и связанные услуги'],
     'Новости и обновления': ['Информация о новых возможностях портала', 'Новости о тендерах и закупках'],
-    'Регуляторные и юридические вопросы': ['Вопросы, связанные с нормативными документами',
-                                           'Правила участия в закупках'],
+    'Регуляторные и юридические вопросы': ['Вопросы, связанные с нормативными документами', 'Правила участия в закупках'],
     'Ошибки и предупреждения': ['Вопросы о неправильных действиях', 'Работа с блокировками или жалобами'],
     'Бессмысленный запрос': []
 }
 
-all_sub_clusters = []
-for cluster in sub_clusters.keys():
-    all_sub_clusters.extend(sub_clusters[cluster])
-all_sub_clusters.append('Бессмысленный запрос')
+def get_default_color(category):
+    """Get default color for a category"""
+    default_colors = {
+        'Общие вопросы о работе с системой': "#8884d8", 'Процессы закупок': "#82ca9d",
+        'Работа с контрактами': "#ffc658", 'Оферты и коммерческие предложения': "#ff8042",
+        'Документы': "#0088FE", 'Работа с категориями продукции': "#00C49F",
+        'Техническая поддержка': "#FFBB28", 'Чаты и обсуждения': "#FF8042",
+        'Финансовые операции': "#a4de6c", 'Новости и обновления': "#d0ed57",
+        'Регуляторные и юридические вопросы': "#8884d8", 'Ошибки и предупреждения': "#82ca9d",
+        'Бессмысленный запрос': "#ff8042"
+    }
+    return default_colors.get(category, "#cccccc") # Default grey if not found
 
 
 @router.get("/clusters")
 def get_clusters_stats(
         db: Session = Depends(get_db),
-        current_admin=Depends(get_current_admin_user),
-        parent_cluster: str = Query(None, alias="parentCluster")
+        current_admin: User = Depends(get_current_admin_user),
+        parentCluster: Optional[str] = Query(None)
 ) -> Dict[str, Any]:
     """
     Get statistics about clusters and sub-clusters used in chats.
-    If a parent cluster is provided (via the query parameter "parentCluster"),
-    returns only the child (sub) clusters for that parent.
+    If a parent cluster is provided, returns only its child sub-clusters.
     """
     try:
-        chats = db.query(Chat).all()
+        query = db.query(Chat)
+        if parentCluster:
+            # Filter by parent cluster before fetching
+            query = query.filter(Chat.categories.any(parentCluster))
 
-        if parent_cluster:
-            # Return subclusters for the specified parent cluster
-            if parent_cluster in sub_clusters:
-                subcategories = sub_clusters[parent_cluster]
+        chats = query.all()
+        logger.info(f"Analyzed {len(chats)} chats for parentCluster='{parentCluster}'")
 
-                # Initialize counts for all subcategories
-                subcategory_counts = {sub: 0 for sub in subcategories}
+        if parentCluster:
+            # Return sub-clusters for the given parent
+            if parentCluster not in sub_clusters:
+                logger.warning(f"Unknown parent cluster requested: {parentCluster}")
+                return {"sub_clusters": []}
 
-                # Count occurrences in actual chat data
-                for chat in chats:
-                    if chat.subcategories:
-                        for sub in chat.subcategories:
-                            if sub in subcategory_counts:
-                                subcategory_counts[sub] += 1
+            valid_subcategories = sub_clusters[parentCluster]
+            subcategory_counts = {sub: 0 for sub in valid_subcategories}
 
-                # Filter out zero values completely
-                filtered_subcategories = {sub: count for sub, count in subcategory_counts.items() if count > 0}
+            for chat in chats: # Iterate only through filtered chats
+                if chat.subcategories:
+                    for sub in chat.subcategories:
+                        if sub in subcategory_counts:
+                            subcategory_counts[sub] += 1
 
-                # If all counts are zero, provide minimal sample data
-                if not filtered_subcategories:
-                    sample_data = []
-                    for i, sub in enumerate(subcategories[:3]):
-                        sample_data.append({
-                            "name": sub,
-                            "requests": i + 1,
-                            "color": "#" + format(hash(sub) % 0xFFFFFF, '06x')
-                        })
-                    return {"sub_clusters": sample_data}
+            sub_stats = [{
+                "name": sub,
+                "requests": count,
+                "color": get_default_color(sub) # Assign color here
+            } for sub, count in subcategory_counts.items()]
 
-                # Convert to list format for API response – only non-zero values
-                sub_stats = [
-                    {"name": sub, "requests": count, "color": "#" + format(hash(sub) % 0xFFFFFF, '06x')}
-                    for sub, count in filtered_subcategories.items()
-                ]
-
-                return {"sub_clusters": sub_stats}
-            else:
-                # Fallback for unknown parent cluster
-                return {
-                    "sub_clusters": [
-                        {"name": "Sample Subcategory", "requests": 1, "color": "#cccccc"}
-                    ]
-                }
+            sub_stats.sort(key=lambda x: x["requests"], reverse=True)
+            logger.info(f"Returning {len(sub_stats)} subcategories for parent {parentCluster}")
+            return {"sub_clusters": sub_stats}
         else:
-            # Return general clusters
+            # Return general clusters stats
             category_counts = {cat: 0 for cat in general_clusters}
-
             for chat in chats:
                 if chat.categories:
                     for cat in chat.categories:
                         if cat in category_counts:
                             category_counts[cat] += 1
 
-            # Filter out zero values completely
-            filtered_categories = {cat: count for cat, count in category_counts.items() if count > 0}
+            general_stats = [{
+                "name": cat,
+                "requests": count,
+                "color": get_default_color(cat)
+            } for cat, count in category_counts.items() if count > 0] # Only include categories with requests
 
-            # If all counts are zero, provide minimal sample data
-            if not filtered_categories:
-                sample_data = []
-                for i, cat in enumerate(general_clusters[:5]):
-                    sample_data.append({
-                        "name": cat,
-                        "requests": i + 2,
-                        "color": get_default_color(cat)
-                    })
-                return {"general_clusters": sample_data}
-
-            # Hard-coded colors for general clusters
-            general_stats = [
-                {"name": cat, "requests": count, "color": get_default_color(cat)}
-                for cat, count in filtered_categories.items()
-            ]
-
+            general_stats.sort(key=lambda x: x["requests"], reverse=True)
+            logger.info(f"Returning {len(general_stats)} general categories")
             return {"general_clusters": general_stats}
 
     except Exception as e:
         logger.error(f"Error getting cluster stats: {str(e)}", exc_info=True)
-        # Return sample data instead of failing
         return {
-            "general_clusters": [
-                {"name": "Sample Category", "requests": 5, "color": "#8884d8"}
-            ]
+            "general_clusters": [] if not parentCluster else None,
+            "sub_clusters": [] if parentCluster else None
         }
-
-
-def get_default_color(category):
-    """Get default color for a category"""
-    default_colors = {
-        'Общие вопросы о работе с системой': "#8884d8",
-        'Процессы закупок': "#82ca9d",
-        'Работа с контрактами': "#ffc658",
-        'Оферты и коммерческие предложения': "#ff8042",
-        'Документы': "#0088FE",
-        'Работа с категориями продукции': "#00C49F",
-        'Техническая поддержка': "#FFBB28",
-        'Чаты и обсуждения': "#FF8042",
-        'Финансовые операции': "#a4de6c",
-        'Новости и обновления': "#d0ed57",
-        'Регуляторные и юридические вопросы': "#8884d8",
-        'Ошибки и предупреждения': "#82ca9d",
-        'Бессмысленный запрос': "#ff8042"
-    }
-    return default_colors.get(category, "#8884d8")
 
 
 @router.get("/cluster-timeseries")
@@ -170,86 +132,86 @@ def get_cluster_timeseries(
         end_date: str = Query(..., description="End date in YYYY-MM-DD"),
         granularity: str = Query("day", description="Data granularity: hour, day, or week"),
         db: Session = Depends(get_db),
-        current_admin=Depends(get_current_admin_user)
+        current_admin: User = Depends(get_current_admin_user)
 ) -> List[Dict[str, Any]]:
     """
     Returns time series data with specified granularity for each general cluster.
     """
     try:
-        # Parse dates
         start_datetime = datetime.strptime(f"{start_date} 00:00:00", "%Y-%m-%d %H:%M:%S")
         end_datetime = datetime.strptime(f"{end_date} 23:59:59", "%Y-%m-%d %H:%M:%S")
 
-        # Determine time formatting based on granularity
+        # Determine time formatting and interval based on granularity
         if granularity == "hour":
-            time_format = lambda dt: dt.strftime("%Y-%m-%d %H:00")
+            time_trunc = "hour"
+            interval = timedelta(hours=1)
+            formatter = lambda dt: dt.strftime("%Y-%m-%d %H:00")
         elif granularity == "week":
-            time_format = lambda dt: (dt - timedelta(days=dt.weekday())).strftime("%Y-%m-%d")
+            time_trunc = "week"
+            interval = timedelta(weeks=1)
+            formatter = lambda dt: (dt - timedelta(days=dt.weekday())).strftime("%Y-%m-%d") # Start of week
         else:  # Default to day
-            time_format = lambda dt: dt.strftime("%Y-%m-%d")
+            time_trunc = "day"
+            interval = timedelta(days=1)
+            formatter = lambda dt: dt.strftime("%Y-%m-%d")
 
-        # Generate time slots between start and end dates
-        time_slots = []
-        current = start_datetime
-        while current <= end_datetime:
-            time_slots.append(time_format(current))
-            if granularity == "hour":
-                current += timedelta(hours=1)
-            elif granularity == "week":
-                current += timedelta(weeks=1)
+        # Generate all expected time slots within the range
+        all_slots = set()
+        current_slot_start = start_datetime
+        while current_slot_start <= end_datetime:
+            if granularity == 'week':
+                 slot_dt = current_slot_start - timedelta(days=current_slot_start.weekday())
             else:
-                current += timedelta(days=1)
+                 slot_dt = current_slot_start
+            if granularity == 'hour': truncated_dt = slot_dt.replace(minute=0, second=0, microsecond=0)
+            elif granularity == 'week': truncated_dt = slot_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            else: truncated_dt = slot_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            all_slots.add(formatter(truncated_dt))
+            current_slot_start += interval
 
-        # Initialize timeseries structure (only non-zero entries will be added)
-        timeseries = {slot: {"date": slot} for slot in time_slots}
+        # Query to aggregate counts per time slot and category
+        query = text(f"""
+            SELECT
+                date_trunc(:granularity, created_at) AS time_slot,
+                unnest(categories) AS category,
+                count(*) AS count
+            FROM chat
+            WHERE created_at BETWEEN :start_date AND :end_date
+            AND categories IS NOT NULL AND cardinality(categories) > 0 -- Ensure categories exist and are not empty
+            GROUP BY time_slot, category
+            ORDER BY time_slot;
+        """)
 
-        # Process chats and count by cluster
-        chats = db.query(Chat).filter(Chat.created_at.between(start_datetime, end_datetime)).all()
-        for chat in chats:
-            if not chat.categories:
-                continue
-            chat_slot = time_format(chat.created_at)
-            if chat_slot not in timeseries:
-                continue
-            for category in chat.categories:
-                if category in general_clusters:
-                    if category not in timeseries[chat_slot]:
-                        timeseries[chat_slot][category] = 0
-                    timeseries[chat_slot][category] += 1
+        results = db.execute(query, {
+            "granularity": time_trunc,
+            "start_date": start_datetime,
+            "end_date": end_datetime
+        }).mappings().all() # Use mappings().all() to get list of dict-like RowMappings
 
-        result = list(timeseries.values())
-        result.sort(key=lambda x: x["date"])
+        # Process results into the timeseries format
+        timeseries_dict: Dict[str, Dict[str, Any]] = {slot: {"date": slot} for slot in all_slots}
+        for slot in timeseries_dict:
+            for gc in general_clusters:
+                timeseries_dict[slot][gc] = 0 # Initialize all clusters to 0
 
-        if not result or all(len(entry) <= 1 for entry in result):
-            result = generate_sample_timeseries_data(start_datetime, end_datetime, granularity)
+        for row in results:
+            # Now access using dictionary keys as mappings() returns dict-like objects
+            slot_str = formatter(row['time_slot'])
+            category = row['category']
+            count = row['count']
 
-        return result
+            if slot_str in timeseries_dict and category in general_clusters:
+                timeseries_dict[slot_str][category] = count
+
+        # Convert to list and sort
+        final_timeseries = sorted(list(timeseries_dict.values()), key=lambda x: x["date"])
+
+        logger.info(f"Generated timeseries data with {len(final_timeseries)} points, granularity: {granularity}")
+        return final_timeseries
 
     except Exception as e:
         logger.error(f"Error in cluster timeseries: {str(e)}", exc_info=True)
-        return generate_sample_timeseries_data(start_datetime, end_datetime, granularity)
-
-
-def generate_sample_timeseries_data(start_date, end_date, granularity):
-    """Generate sample timeseries data with the correct format"""
-    sample_data = []
-    current = start_date
-    categories = general_clusters[:3]
-    while current <= end_date:
-        if granularity == "hour":
-            time_str = current.strftime("%Y-%m-%d %H:00")
-            current += timedelta(hours=4)
-        elif granularity == "week":
-            time_str = current.strftime("%Y-%m-%d")
-            current += timedelta(weeks=1)
-        else:
-            time_str = current.strftime("%Y-%m-%d")
-            current += timedelta(days=1)
-        data_point = {"date": time_str}
-        for i, category in enumerate(categories):
-            data_point[category] = (i + 1) * (hash(time_str) % 3 + 1)
-        sample_data.append(data_point)
-    return sample_data
+        return [] # Return empty list on error
 
 
 @router.get("/feedback")
@@ -258,126 +220,148 @@ def get_feedback_stats(
         to_date: str = Query(None, description="End date in YYYY-MM-DD"),
         granularity: str = Query("hour", description="Data granularity: hour, day, or week"),
         db: Session = Depends(get_db),
-        current_admin=Depends(get_current_admin_user)
+        current_admin: User = Depends(get_current_admin_user)
 ) -> List[Dict[str, Any]]:
     """
-    Returns feedback stats with specified granularity.
+    Returns feedback stats (likes/dislikes) with specified granularity.
     """
     try:
         today = datetime.utcnow().date()
-        if from_date:
-            start_date = datetime.strptime(f"{from_date} 00:00:00", "%Y-%m-%d %H:%M:%S")
-        else:
-            start_date = datetime.combine(today - timedelta(days=1), datetime.min.time())
-        if to_date:
-            end_date = datetime.strptime(f"{to_date} 23:59:59", "%Y-%m-%d %H:%M:%S")
-        else:
-            end_date = datetime.combine(today, datetime.max.time())
+        start_datetime = datetime.strptime(f"{from_date} 00:00:00", "%Y-%m-%d %H:%M:%S") if from_date else datetime.combine(today - timedelta(days=7), datetime.min.time())
+        end_datetime = datetime.strptime(f"{to_date} 23:59:59", "%Y-%m-%d %H:%M:%S") if to_date else datetime.combine(today, datetime.max.time())
+
         if granularity == "hour":
-            time_format = "date_trunc('hour', m.created_at)"
+            time_trunc = "hour"
+            interval = timedelta(hours=1)
             formatter = lambda dt: dt.strftime("%Y-%m-%d %H:00")
         elif granularity == "week":
-            time_format = "date_trunc('week', m.created_at)"
+            time_trunc = "week"
+            interval = timedelta(weeks=1)
+            # Correct formatter for week start
+            formatter = lambda dt: (dt - timedelta(days=dt.weekday())).strftime("%Y-%m-%d")
+        else: # Default to day
+            time_trunc = "day"
+            interval = timedelta(days=1)
             formatter = lambda dt: dt.strftime("%Y-%m-%d")
-        else:
-            time_format = "date_trunc('day', m.created_at)"
-            formatter = lambda dt: dt.strftime("%Y-%m-%d")
+
+        # Generate all expected time slots
+        all_slots = set()
+        current_slot_start = start_datetime
+        while current_slot_start <= end_datetime:
+            # Ensure correct start date for weekly grouping
+            if granularity == 'week':
+                slot_dt = current_slot_start - timedelta(days=current_slot_start.weekday())
+            else:
+                slot_dt = current_slot_start
+            # Truncate based on granularity
+            if granularity == 'hour': truncated_dt = slot_dt.replace(minute=0, second=0, microsecond=0)
+            elif granularity == 'week': truncated_dt = slot_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            else: truncated_dt = slot_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            all_slots.add(formatter(truncated_dt))
+            current_slot_start += interval
+        # Ensure the last possible slot is included
+        if granularity == 'week': last_slot_dt = end_datetime - timedelta(days=end_datetime.weekday())
+        else: last_slot_dt = end_datetime
+        if granularity == 'hour': last_truncated_dt = last_slot_dt.replace(minute=0, second=0, microsecond=0)
+        elif granularity == 'week': last_truncated_dt = last_slot_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        else: last_truncated_dt = last_slot_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        all_slots.add(formatter(last_truncated_dt))
+
+
+        # Query to aggregate reaction counts
         query = text(f"""
-            WITH time_series AS (
-                SELECT generate_series(
-                    :start_date::timestamp, 
-                    :end_date::timestamp, 
-                    CASE 
-                        WHEN :granularity = 'hour' THEN '1 hour'::interval
-                        WHEN :granularity = 'week' THEN '1 week'::interval
-                        ELSE '1 day'::interval
-                    END
-                ) AS time_slot
-            ),
-            reaction_data AS (
-                SELECT 
-                    {time_format} as time_slot,
-                    r.reaction_type,
-                    count(*) as count
-                FROM message m
-                JOIN reaction r ON r.message_id = m.id
-                WHERE m.created_at BETWEEN :start_date AND :end_date
-                GROUP BY time_slot, r.reaction_type
-            )
-            SELECT 
-                time_series.time_slot,
-                coalesce(sum(CASE WHEN rd.reaction_type = 'like' THEN rd.count ELSE 0 END), 0) as likes,
-                coalesce(sum(CASE WHEN rd.reaction_type = 'dislike' THEN rd.count ELSE 0 END), 0) as dislikes
-            FROM time_series
-            LEFT JOIN reaction_data rd ON time_series.time_slot = rd.time_slot
-            GROUP BY time_series.time_slot
-            ORDER BY time_series.time_slot
+            SELECT
+                date_trunc(:granularity, r.created_at) as time_slot,
+                r.reaction_type,
+                count(*) as count
+            FROM reaction r
+            JOIN message m ON r.message_id = m.id -- Join to ensure message exists
+            WHERE r.created_at BETWEEN :start_date AND :end_date
+            GROUP BY time_slot, r.reaction_type
+            ORDER BY time_slot;
         """)
-        result = db.execute(query, {
-            "start_date": start_date,
-            "end_date": end_date,
-            "granularity": granularity
-        }).fetchall()
-        feedback_data = []
-        for row in result:
-            if row['likes'] > 0 or row['dislikes'] > 0:
-                feedback_data.append({
-                    "date": formatter(row['time_slot']),
-                    "likes": int(row['likes']),
-                    "dislikes": int(row['dislikes']),
-                })
-        if not feedback_data:
-            feedback_data = generate_sample_feedback_data(start_date, end_date, granularity)
-        return feedback_data
+
+        results = db.execute(query, {
+            "granularity": time_trunc,
+            "start_date": start_datetime,
+            "end_date": end_datetime
+        }).mappings().all()
+
+        # Process results
+        feedback_dict: Dict[str, Dict[str, Any]] = {slot: {"date": slot, "likes": 0, "dislikes": 0} for slot in all_slots}
+
+        for row in results:
+            # Ensure time_slot is a datetime object before formatting
+            time_slot_dt = row.get('time_slot')
+            if not isinstance(time_slot_dt, datetime):
+                logger.warning(f"Skipping row with invalid time_slot type: {time_slot_dt}")
+                continue
+
+            slot_str = formatter(time_slot_dt)
+            reaction_type = row['reaction_type']
+            count = row['count']
+
+            if slot_str in feedback_dict:
+                # Make sure reaction_type is converted to string for comparison
+                if str(reaction_type) == 'like':
+                    feedback_dict[slot_str]['likes'] += count # Use += to accumulate if needed (though group by should handle this)
+                elif str(reaction_type) == 'dislike':
+                    feedback_dict[slot_str]['dislikes'] += count
+            else:
+                 logger.warning(f"Calculated slot '{slot_str}' not found in initial dictionary. Row: {row}")
+
+
+        # Convert to list and sort
+        final_feedback = sorted(list(feedback_dict.values()), key=lambda x: x["date"])
+
+        # Filter out entries where both likes and dislikes are zero AFTER processing all results
+        # final_feedback_filtered = [item for item in final_feedback if item["likes"] > 0 or item["dislikes"] > 0]
+
+        logger.info(f"Generated feedback data with {len(final_feedback)} points, granularity: {granularity}")
+        # logger.debug(f"Feedback data sample: {final_feedback[:5]}")
+        return final_feedback # Return all slots
 
     except Exception as e:
         logger.error(f"Error getting feedback stats: {str(e)}", exc_info=True)
-        return generate_sample_feedback_data(start_date, end_date, granularity)
-
-
-def generate_sample_feedback_data(start_date, end_date, granularity):
-    """Generate sample feedback data with realistic format"""
-    sample_data = []
-    current = start_date
-    while current <= end_date:
-        if granularity == "hour":
-            time_str = current.strftime("%Y-%m-%d %H:00")
-            current += timedelta(hours=4)
-        elif granularity == "week":
-            time_str = current.strftime("%Y-%m-%d")
-            current += timedelta(weeks=1)
-        else:
-            time_str = current.strftime("%Y-%m-%d")
-            current += timedelta(days=1)
-        likes = max(1, hash(time_str) % 5)
-        dislikes = max(0, (hash(time_str) // 10) % 3)
-        sample_data.append({
-            "date": time_str,
-            "likes": likes,
-            "dislikes": dislikes,
-        })
-    return sample_data
-
+        return []
 
 @router.get("/stats")
 def get_admin_stats(
         db: Session = Depends(get_db),
-        current_admin=Depends(get_current_admin_user)
+        current_admin: User = Depends(get_current_admin_user),
+        from_date: Optional[str] = Query(None, alias="from"),
+        to_date: Optional[str] = Query(None, alias="to"),
 ) -> Dict[str, Any]:
     """
-    Get admin dashboard statistics.
+    Get admin dashboard statistics, optionally filtered by date range for chats/reactions.
     """
     try:
-        total_users = db.query(User).count()
-        week_ago = datetime.utcnow() - timedelta(days=7)
-        active_chats = db.query(Chat).filter(Chat.updated_at >= week_ago).count()
-        positive_reactions = db.query(Reaction).filter(Reaction.reaction_type == "like").count()
-        negative_reactions = db.query(Reaction).filter(Reaction.reaction_type == "dislike").count()
+        total_users = db.query(func.count(User.id)).scalar()
+
+        # Date filtering for chats and reactions
+        chat_query = db.query(func.count(Chat.id))
+        reaction_query_likes = db.query(func.count(Reaction.id)).filter(Reaction.reaction_type == "like")
+        reaction_query_dislikes = db.query(func.count(Reaction.id)).filter(Reaction.reaction_type == "dislike")
+
+        if from_date and to_date:
+            try:
+                start_date = datetime.strptime(from_date, "%Y-%m-%d")
+                end_date = datetime.strptime(to_date, "%Y-%m-%d") + timedelta(days=1)
+                chat_query = chat_query.filter(Chat.updated_at.between(start_date, end_date))
+                reaction_query_likes = reaction_query_likes.filter(Reaction.created_at.between(start_date, end_date))
+                reaction_query_dislikes = reaction_query_dislikes.filter(Reaction.created_at.between(start_date, end_date))
+            except ValueError:
+                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid date format. Use YYYY-MM-DD.")
+
+        active_chats = chat_query.scalar()
+        positive_reactions = reaction_query_likes.scalar()
+        negative_reactions = reaction_query_dislikes.scalar()
+
         return {
-            "totalUsers": total_users,
-            "activeChats": active_chats,
-            "positiveReactions": positive_reactions,
-            "negativeReactions": negative_reactions,
+            "totalUsers": total_users or 0,
+            "activeChats": active_chats or 0,
+            "positiveReactions": positive_reactions or 0,
+            "negativeReactions": negative_reactions or 0,
             "timestamp": datetime.utcnow().isoformat()
         }
     except Exception as e:
@@ -391,36 +375,199 @@ def get_admin_stats(
         }
 
 
-@router.get("/chats", response_model=ChatList)
+@router.get("/chats", response_model=PaginatedResponse[AdminChat]) # Use AdminChat schema
 def get_admin_chats(
-    skip: int = 0,
-    limit: int = 100,
-    cluster: Optional[str] = Query(None),
-    subCluster: Optional[str] = Query(None, alias="subCluster"),
-    from_date: Optional[str] = Query(None, alias="from"),
-    to_date: Optional[str] = Query(None, alias="to"),
-    db: Session = Depends(get_db),
-    current_admin=Depends(get_current_admin_user),
+        skip: int = 0,
+        limit: int = 100,
+        cluster: Optional[str] = Query(None),
+        subCluster: Optional[str] = Query(None),
+        from_date: Optional[str] = Query(None, alias="from"),
+        to_date: Optional[str] = Query(None, alias="to"),
+        db: Session = Depends(get_db),
+        current_admin: User = Depends(get_current_admin_user),
 ):
     """
-    Get chats filtered by cluster and subCluster for admin.
-    If a subCluster is provided, return chats that belong to that child cluster;
-    otherwise, if a cluster is provided, filter by the parent cluster.
-    Optionally, filter by a creation date range.
+    Get chats with filtering for admin view. Returns PaginatedResponse[AdminChat].
     """
-    query = db.query(Chat)
-    if from_date and to_date:
-        try:
-            start_date = datetime.strptime(from_date, "%Y-%m-%d")
-            end_date = datetime.strptime(to_date, "%Y-%m-%d")
-            query = query.filter(Chat.created_at.between(start_date, end_date))
-        except Exception as e:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
-                                detail="Invalid date format. Use YYYY-MM-DD.")
-    if subCluster:
-        query = query.filter(Chat.subcategories.any(subCluster))
-    elif cluster:
-        query = query.filter(Chat.categories.any(cluster))
-    total = query.count()
-    chats = query.order_by(Chat.created_at.desc()).offset(skip).limit(limit).all()
-    return ChatList(items=chats, total=total)
+    try:
+        query = db.query(Chat).options(
+            joinedload(Chat.user), # Eager load user
+             # Subquery to count messages and reactions separately
+        )
+
+        # --- Subquery for Message Count ---
+        message_count_subquery = (
+            db.query(Message.chat_id, func.count(Message.id).label("message_count"))
+            .group_by(Message.chat_id)
+            .subquery()
+        )
+        query = query.outerjoin(
+            message_count_subquery, Chat.id == message_count_subquery.c.chat_id
+        )
+        query = query.add_columns(
+            func.coalesce(message_count_subquery.c.message_count, 0).label("message_count")
+        )
+
+        # --- Subquery for Likes ---
+        likes_subquery = (
+            db.query(Message.chat_id, func.count(Reaction.id).label("likes_count"))
+            .join(Reaction, Message.id == Reaction.message_id)
+            .filter(Reaction.reaction_type == "like")
+            .group_by(Message.chat_id)
+            .subquery()
+        )
+        query = query.outerjoin(
+            likes_subquery, Chat.id == likes_subquery.c.chat_id
+        )
+        query = query.add_columns(
+            func.coalesce(likes_subquery.c.likes_count, 0).label("likes_count")
+        )
+
+        # --- Subquery for Dislikes ---
+        dislikes_subquery = (
+            db.query(Message.chat_id, func.count(Reaction.id).label("dislikes_count"))
+            .join(Reaction, Message.id == Reaction.message_id)
+            .filter(Reaction.reaction_type == "dislike")
+            .group_by(Message.chat_id)
+            .subquery()
+        )
+        query = query.outerjoin(
+            dislikes_subquery, Chat.id == dislikes_subquery.c.chat_id
+        )
+        query = query.add_columns(
+            func.coalesce(dislikes_subquery.c.dislikes_count, 0).label("dislikes_count")
+        )
+
+
+        # Date range filtering
+        if from_date and to_date:
+            try:
+                start_date = datetime.strptime(from_date, "%Y-%m-%d")
+                end_date = datetime.strptime(to_date, "%Y-%m-%d") + timedelta(days=1)
+                query = query.filter(Chat.created_at.between(start_date, end_date))
+            except ValueError:
+                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid date format. Use YYYY-MM-DD.")
+
+        # Cluster/Subcluster filtering
+        if subCluster:
+            query = query.filter(Chat.subcategories.any(subCluster))
+            logger.info(f"Filtering chats by subCluster: {subCluster}")
+        elif cluster:
+            query = query.filter(Chat.categories.any(cluster))
+            logger.info(f"Filtering chats by cluster: {cluster}")
+
+        # --- Total Count ---
+        # Create a separate query for counting to avoid issues with columns/joins
+        count_query = db.query(func.count(Chat.id))
+        if from_date and to_date: count_query = count_query.filter(Chat.created_at.between(start_date, end_date))
+        if subCluster: count_query = count_query.filter(Chat.subcategories.any(subCluster))
+        elif cluster: count_query = count_query.filter(Chat.categories.any(cluster))
+        total = count_query.scalar() or 0
+
+        logger.info(f"Found {total} chats matching admin filters")
+
+        # Apply ordering, offset, and limit to the main query
+        results = query.order_by(Chat.updated_at.desc()).offset(skip).limit(limit).all()
+
+        # Manually construct the response to match AdminChat schema
+        admin_chats = []
+        for row in results:
+            chat = row[0] # The Chat object is the first element
+            msg_count = row.message_count
+            likes = row.likes_count
+            dislikes = row.dislikes_count
+
+            admin_chats.append(AdminChat(
+                id=chat.id,
+                title=chat.title,
+                user=UserSchema.from_orm(chat.user) if chat.user else None,
+                categories=chat.categories or [],
+                subcategories=chat.subcategories or [],
+                created_at=chat.created_at,
+                updated_at=chat.updated_at,
+                message_count=msg_count,
+                likes=likes,
+                dislikes=dislikes,
+            ))
+
+        return PaginatedResponse(items=admin_chats, total=total)
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Error getting admin chats: {str(e)}", exc_info=True)
+        return PaginatedResponse(items=[], total=0) # Return empty on error
+
+
+@router.get("/chats/{chat_id}", response_model=AdminChatDetail) # Use AdminChatDetail schema
+def get_admin_chat_detail(
+        chat_id: UUID,
+        db: Session = Depends(get_db),
+        current_admin: User = Depends(get_current_admin_user)
+):
+    """
+    Retrieve detailed information for a specific chat by chat_id for admin.
+    """
+    try:
+        # Query the chat with eager loading of all related data
+        chat = db.query(Chat).options(
+            joinedload(Chat.user),
+            selectinload(Chat.messages).options(
+                selectinload(Message.reactions),
+                selectinload(Message.sources),
+                selectinload(Message.files).joinedload(MessageFile.file) # Eager load File via MessageFile
+            ).order_by(Message.created_at) # Order messages within the chat
+        ).filter(Chat.id == chat_id).first()
+
+        if not chat:
+            logger.warning(f"Admin requested non-existent chat: {chat_id}")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
+
+        # Use the AdminChatDetail schema for response validation and serialization
+        return AdminChatDetail.from_orm(chat)
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Error retrieving admin chat detail {chat_id}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
+
+
+@router.get("/users", response_model=PaginatedResponse[AdminUser])
+def get_admin_users(
+        skip: int = 0,
+        limit: int = 100,
+        db: Session = Depends(get_db),
+        current_admin: User = Depends(get_current_admin_user),
+):
+    """
+    Get a list of users for admin view.
+    """
+    try:
+        query = db.query(User)
+        total = query.count()
+        users = query.order_by(User.created_at.desc()).offset(skip).limit(limit).all()
+
+        return PaginatedResponse(items=users, total=total)
+    except Exception as e:
+        logger.error(f"Error getting admin users: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve users")
+
+
+@router.get("/users/{user_id}", response_model=AdminUser)
+def get_admin_user_detail(
+        user_id: UUID,
+        db: Session = Depends(get_db),
+        current_admin: User = Depends(get_current_admin_user)
+):
+    """
+    Get details for a specific user.
+    """
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+        return user
+    except Exception as e:
+        logger.error(f"Error getting user detail {user_id}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve user details")

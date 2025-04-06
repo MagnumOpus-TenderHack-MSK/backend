@@ -198,6 +198,19 @@ def update_ai_message(db: Session, message_id: UUID, content: str, status: Messa
                       sources: List[Dict[str, Any]] = None) -> Message:
     """
     Update an AI message with new content and status.
+
+    Args:
+        db: Database session
+        message_id: ID of the message to update
+        content: New message content
+        status: New message status
+        sources: Optional list of sources to add
+
+    Returns:
+        Updated message object
+
+    Raises:
+        HTTPException: If message not found
     """
     message = db.query(Message).filter(Message.id == message_id).first()
 
@@ -215,15 +228,26 @@ def update_ai_message(db: Session, message_id: UUID, content: str, status: Messa
 
     # Add sources if any
     if sources:
+        # First clean up any existing sources
+        db.query(Source).filter(Source.message_id == message_id).delete()
+
+        # Then add the new sources
         for source_data in sources:
+            # Extract data with appropriate fallbacks
+            title = source_data.get("title", "") or source_data.get("source", "")
+            ref_id = source_data.get("id", "") or source_data.get("url", "")
+            page = source_data.get("page", None)
+
+            # Create source with correct format for document references
             source = Source(
-                message_id=message.id,
-                title=source_data.get("title", ""),
-                url=source_data.get("url"),
-                content=source_data.get("content")
+                message_id=message_id,
+                title=title,
+                url=str(ref_id),  # Store raw reference ID in url
+                content=str(page) if page else None  # Store just the page number without prefix
             )
             db.add(source)
 
+        logger.info(f"Added {len(sources)} sources to message {message_id}")
         db.commit()
 
     return message

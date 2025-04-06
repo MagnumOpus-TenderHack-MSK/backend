@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
 from app.core.config import settings
-from app.api import auth, chats, files, websockets, admin
+from app.api import auth, chats, files, websockets, admin, documents
 
 # Set up logging
 logging.basicConfig(
@@ -58,6 +58,7 @@ app.include_router(auth.router, prefix="/api")
 app.include_router(chats.router, prefix="/api")
 app.include_router(files.router, prefix="/api")
 app.include_router(admin.router, prefix="/api")
+app.include_router(documents.router, prefix="/api")
 app.include_router(websockets.router)
 
 # Mount static files with proper configuration

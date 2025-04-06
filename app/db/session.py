@@ -6,8 +6,8 @@ from app.core.config import settings
 engine = create_engine(
     settings.DATABASE_URL,
     pool_pre_ping=True,  # Health check for connections
-    pool_size=20,         # adjust to your expected load
-    max_overflow=10,      # extra connections beyond pool_size
+    pool_size=50,         # adjust to your expected load
+    max_overflow=20,      # extra connections beyond pool_size
 )
 
 # Create session factory

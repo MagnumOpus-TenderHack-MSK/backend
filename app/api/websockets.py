@@ -104,6 +104,7 @@ async def websocket_endpoint(
     user_connection_id = None
     connection_key = None
     socket_already_closed = False
+    is_new_chat = websocket.query_params.get("new_chat") == "true"
 
     # Clear any existing closed connection record
     if ws_id in connection_ids:
@@ -147,7 +148,7 @@ async def websocket_endpoint(
             socket_already_closed = True
             return
 
-        # Accept connection
+        # Accept connection - MUST BE DONE BEFORE ANY receive_text() CALLS
         try:
             await websocket.accept()
             logger.info(f"WebSocket connection accepted for chat {chat_id}, user {user_id}")
@@ -156,7 +157,7 @@ async def websocket_endpoint(
             socket_already_closed = True
             return
 
-        # Register connection
+        # Register connection AFTER accepting the websocket
         if connection_key not in active_connections:
             active_connections[connection_key] = {
                 "connections": [],
@@ -170,13 +171,21 @@ async def websocket_endpoint(
 
         # Send welcome message for connection confirmation
         try:
-            await safe_send_json(websocket, {
+            initMessage = {
                 "type": "connection_established",
                 "chat_id": str(chat_id),
                 "timestamp": str(asyncio.get_event_loop().time())
-            })
+            }
+
+            # If this is a new chat, include initial suggestions
+            if is_new_chat and chat.suggestions:
+                initMessage["suggestions"] = chat.suggestions
+                logger.info(f"Sending initial suggestions for new chat: {chat.suggestions}")
+
+            await safe_send_json(websocket, initMessage)
         except Exception as e:
             logger.error(f"Error sending welcome message: {str(e)}")
+            # Continue even if welcome message fails
 
         # Main connection loop
         try:
@@ -185,10 +194,14 @@ async def websocket_endpoint(
                 ping_client(websocket, connection_key)
             )
 
+            # Use a larger timeout to avoid frequent reconnections
+            receive_timeout = 120  # 2 minutes
+
             while is_websocket_connected(websocket):
                 # Process incoming messages with timeout
                 try:
-                    data = await asyncio.wait_for(websocket.receive_text(), timeout=60)
+                    # IMPORTANT: Only call receive_text() after websocket.accept()
+                    data = await asyncio.wait_for(websocket.receive_text(), timeout=receive_timeout)
 
                     # Update activity timestamp
                     if connection_key in active_connections:
@@ -237,6 +250,19 @@ async def websocket_endpoint(
                             "content": content
                         })
 
+                    elif message_type == "get_suggestions":
+                        # Client is requesting suggestions for this chat
+                        if chat.suggestions:
+                            await safe_send_json(websocket, {
+                                "type": "suggestions",
+                                "suggestions": chat.suggestions
+                            })
+                        else:
+                            await safe_send_json(websocket, {
+                                "type": "suggestions",
+                                "suggestions": []
+                            })
+
                     else:
                         # Unknown message type
                         logger.warning(f"Unknown message type '{message_type}' from user {user_id}")
@@ -245,7 +271,9 @@ async def websocket_endpoint(
                         })
 
                 except asyncio.TimeoutError:
-                    # Handle timeout - continue waiting
+                    # Handle timeout gracefully - just continue waiting
+                    # This timeout is just to allow periodic checks, not an error
+                    logger.debug(f"No message received from client after {receive_timeout}s - continuing")
                     continue
                 except WebSocketDisconnect:
                     # Handle normal disconnect
@@ -291,8 +319,11 @@ async def websocket_endpoint(
 async def ping_client(websocket: WebSocket, connection_key: str):
     """Periodically ping the client to keep the connection alive."""
     try:
+        # Use a longer ping interval to reduce overhead
+        ping_interval = 45  # 45 seconds
+
         while is_websocket_connected(websocket):
-            await asyncio.sleep(30)  # Send ping every 30 seconds
+            await asyncio.sleep(ping_interval)
 
             if not is_websocket_connected(websocket):
                 break
@@ -363,14 +394,34 @@ async def broadcast_message_complete(
         sources: List[Dict[str, Any]] = None,
         suggestions: List[str] = None
 ):
-    """Broadcast message completion to all connections for a chat."""
+    """Broadcast message completion to all connections for a chat.
+
+    Args:
+        chat_id: The chat ID
+        user_id: The user ID
+        message_id: The message ID
+        sources: Optional list of source references
+        suggestions: Optional list of suggested followup messages
+    """
     message = {
         "type": "complete",
         "message_id": str(message_id)
     }
 
     if sources:
-        message["sources"] = sources
+        # Process sources to ensure they're in the right format
+        processed_sources = []
+        for source in sources:
+            # Standardize source fields - ensure we have the expected properties
+            processed_source = {
+                "id": source.get("id", ""),
+                "title": source.get("source", "") or source.get("title", ""),
+                "content": source.get("page", None),  # Use page directly, without "Page " prefix
+                "url": source.get("id", "")  # Use id as url for reference matching
+            }
+            processed_sources.append(processed_source)
+
+        message["sources"] = processed_sources
 
     if suggestions:
         message["suggestions"] = suggestions
@@ -378,43 +429,3 @@ async def broadcast_message_complete(
 
     logger.info(f"Broadcasting completion for message {message_id} to chat {chat_id}, user {user_id}")
     await broadcast_message(chat_id, user_id, message)
-
-
-# Periodic task to clean up stale connections
-async def cleanup_stale_connections():
-    """Periodically clean up stale connections."""
-    while True:
-        try:
-            await asyncio.sleep(60)  # Run every minute
-
-            now = asyncio.get_event_loop().time()
-            stale_keys = []
-
-            for connection_key, data in active_connections.items():
-                # Check last activity (inactive for more than 10 minutes)
-                if now - data["last_activity"] > 600:
-                    stale_keys.append(connection_key)
-
-            # Close and remove stale connections
-            for key in stale_keys:
-                connections = active_connections[key]["connections"].copy()
-                for conn in connections:
-                    try:
-                        if is_websocket_connected(conn):
-                            await conn.close(code=1000, reason="Inactivity timeout")
-                    except Exception as e:
-                        logger.error(f"Error closing stale connection: {str(e)}")
-
-                # Remove the connection entry
-                del active_connections[key]
-                logger.info(f"Removed stale connection {key}")
-
-        except Exception as e:
-            logger.error(f"Error in cleanup task: {str(e)}")
-
-
-# Start cleanup task
-@router.on_event("startup")
-async def start_cleanup_task():
-    """Start the periodic cleanup task when the application starts."""
-    asyncio.create_task(cleanup_stale_connections())
